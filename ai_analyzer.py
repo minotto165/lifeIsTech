@@ -1,9 +1,13 @@
 import os
 from google import genai
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # 新しいSDKを用いたAI解析モジュール
 def get_ai_response(prompt):
     api_key = os.environ.get("GEMINI_API_KEY")
+    
     if not api_key:
         return None
     
