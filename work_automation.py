@@ -1,106 +1,158 @@
-import os
-import time
-from playwright.sync_api import sync_playwright
+"""Life is Tech! 理解度チェックワークの自動解答スクリプト。"""
+
+import random
+
+import config
 from ai_analyzer import get_ai_response
-from human_utils import human_sleep, human_click
+from chrome_session import ChromeSession
+from human_utils import human_click, human_sleep
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def count(page, selector):
+    try:
+        return page.locator(selector).count()
+    except Exception:
+        return 0
+
+
+def click_if_present(page, selector, base_delay=1.0):
+    locator = page.locator(selector)
+    if locator.count() == 0:
+        return False
+    try:
+        human_click(locator.first, base_delay=base_delay)
+        return True
+    except Exception as e:
+        log(f"要素のクリックに失敗しました: {e}")
+        return False
+
+
+def read_question(page):
+    """問題文が描画されるまで待つ。取得できなければ None を返す。"""
+    question_locs = page.locator(config.SEL_WORK_QUESTION)
+    for _ in range(config.QUESTION_RETRY_COUNT):
+        if count(page, config.SEL_WORK_GRADE_BTN) > 0:
+            return None
+        if question_locs.count() > config.WORK_QUESTION_INDEX:
+            try:
+                text = question_locs.nth(config.WORK_QUESTION_INDEX).inner_text().strip()
+            except Exception:
+                text = ""
+            if text:
+                return text
+        human_sleep(config.QUESTION_RETRY_INTERVAL)
+    return None
+
+
+def collect_options(page):
+    """ラジオボタンを持つ label だけを選択肢として収集する。"""
+    labels = page.locator(config.SEL_WORK_OPTION_LABEL)
+    options = {}
+    for i in range(labels.count()):
+        label = labels.nth(i)
+        try:
+            text = label.inner_text().strip()
+        except Exception:
+            continue
+        if not text or len(text) > config.MAX_OPTION_TEXT_LENGTH:
+            continue
+        if label.locator("input").count() == 0:
+            continue
+        if text not in options:
+            options[text] = label.locator("input").first
+    return options
+
+
+def choose_option(options, ai_result):
+    """AI の回答と誤答確率から、実際にクリックする選択肢を決める。"""
+    if not options:
+        return None, False
+    correct = [
+        text
+        for text in options
+        if ai_result and (text in ai_result or ai_result in text)
+    ]
+    if correct and len(options) > 1 and random.random() < config.WRONG_ANSWER_RATE:
+        wrong = [text for text in options if text not in correct]
+        if wrong:
+            return random.choice(wrong), True
+    if correct:
+        return correct[0], False
+    return None, False
+
+
+def answer_question(page):
+    """問題を解いて選択肢をクリックする。問題が無ければ None。"""
+    question_text = read_question(page)
+    if question_text is None:
+        return None
+
+    options = collect_options(page)
+    if not options:
+        log("選択肢を取得できませんでした。")
+        return question_text
+
+    prompt = (
+        f"問題: {question_text}\n"
+        f"選択肢: {list(options.keys())}\n"
+        "正解の選択肢のテキストを一つだけ、余計な言葉なしで返してください。"
+    )
+    text, intentional_error = choose_option(options, get_ai_response(prompt))
+    if text is None:
+        log("正解を特定できませんでした。次の画面へ進みます。")
+        return question_text
+
+    if intentional_error:
+        log(f"意図的に誤答します: {text}")
+    try:
+        human_click(options[text], base_delay=0.2)
+        human_sleep(0.2)
+    except Exception as e:
+        log(f"選択肢のクリックに失敗しました: {e}")
+    return question_text
+
+
+def go_next(page):
+    """次へ進む・確認・採点のいずれかを押す。押せなければ False。"""
+    if click_if_present(page, config.SEL_WORK_NEXT_BTN, base_delay=1.5):
+        return True
+    if click_if_present(page, config.SEL_WORK_CONFIRM_BTN, base_delay=0.5):
+        return True
+    if click_if_present(page, config.SEL_WORK_GRADE_BTN, base_delay=0.5):
+        log("採点しました。")
+        return True
+    return False
+
 
 def solve_work():
-    print("--- 理解度チェックワーク自動化を開始します ---")
-    p = sync_playwright().start()
-    browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
-    context = browser.contexts[0]
-    context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    page = context.pages[0]
+    log("--- 理解度チェックワーク自動化を開始します ---")
+    try:
+        with ChromeSession() as page:
+            for _ in range(config.MAX_LOOP_ITERATIONS):
+                if click_if_present(page, config.SEL_WORK_GRADE_BTN, base_delay=2.0):
+                    log("採点しました。")
+                    return
 
-    while True:
-        # 採点画面の検知 (問題文がない画面)
-        grade_btn = page.locator('button:has-text("この内容で採点する")')
-        if grade_btn.count() > 0:
-            human_click(grade_btn.first, base_delay=2.0)
-            break
+                question_text = answer_question(page)
+                if question_text is None:
+                    if click_if_present(page, config.SEL_WORK_GRADE_BTN, base_delay=2.0):
+                        log("採点しました。")
+                        return
+                    log("問題文を取得できなかったため終了します。")
+                    return
 
-        # 1. 問題文の取得
-        question_locs = page.locator('span.css-mzz7lz')
-        
-        # 待機ループ
-        retry_count = 0
-        while question_locs.count() < 2 and retry_count < 5:
-            if grade_btn.count() > 0:
-                break
-            human_sleep(2.0)
-            retry_count += 1
-        
-        # 採点画面判定の再確認
-        if grade_btn.count() > 0:
-            continue
-
-        if question_locs.count() < 2:
-            break
-        
-        # 2番目の要素（インデックス1）を問題文として採用
-        question_text = question_locs.nth(1).inner_text().strip()
-        
-        if not question_text:
-            break
-        
-        # 2. 選択肢を取得
-        radio_labels = page.locator('label')
-        options = {}
-        for i in range(radio_labels.count()):
-            label = radio_labels.nth(i)
-            text = label.inner_text().strip()
-            if text and len(text) < 50:
-                input_el = label.locator('input')
-                options[text] = input_el
-            
-        # AIに回答を依頼
-        prompt = f"問題: {question_text}\n選択肢: {list(options.keys())}\n正解の選択肢のテキストを一つだけ、余計な言葉なしで返してください。"
-        result = get_ai_response(prompt)
-        
-        if result:
-            result = result.strip()
-            
-            # 回答をクリック
-            import random
-            is_intentional_error = random.random() < 0.15 # 15%の確率で誤答
-            
-            correct_items = []
-            for text, input_el in options.items():
-                if text in result or result in text:
-                    correct_items.append((text, input_el))
-            
-            if is_intentional_error and len(options) > 1:
-                # 誤答対象を選定（正解以外から選ぶ）
-                wrong_items = [item for item in options.items() if item not in correct_items]
-                if wrong_items:
-                    _, target_input = random.choice(wrong_items)
-                    human_click(target_input, base_delay=0.1)
-                    human_sleep(0.1)
-                else:
-                    if correct_items:
-                        _, input_el = correct_items[0]
-                        human_click(input_el, base_delay=0.1)
-                        human_sleep(0.1)
-            else:
-                if correct_items:
-                    _, input_el = correct_items[0]
-                    human_click(input_el, base_delay=0.1)
-                    human_sleep(0.1)
-
-        # 遷移ボタンをクリック
-        next_btn = page.locator('button:has-text("次へ進む")')
-        confirm_btn = page.locator('button:has-text("解答内容を確認"), button:has-text("解答確認へ")')
-        grade_btn = page.locator('button:has-text("この内容で採点する")')
-        
-        if next_btn.count() > 0:
-            human_click(next_btn.first, base_delay=1.5)
-        elif confirm_btn.count() > 0:
-            human_click(confirm_btn.first, base_delay=0.5)
-        elif grade_btn.count() > 0:
-            human_click(grade_btn.first, base_delay=0.5)
-            break
-        else:
-            break
+                if not go_next(page):
+                    log("遷移ボタンが見つからないため終了します。")
+                    return
+            log("最大ループ回数に達したため終了します。")
+    except KeyboardInterrupt:
+        log("処理を中断しました。")
+    except Exception as e:
+        log(f"エラーが発生したため終了します: {e}")
 
 
 if __name__ == "__main__":
