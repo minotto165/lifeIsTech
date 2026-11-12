@@ -1,0 +1,413 @@
+"""未完了レッスンを自動選択して連続実行するランナー。
+
+Chrome に接続し、受講者 API からコース・章・レッスンの進捗を取得して
+「最初の未完了レッスン」から順に、レッスン画面を開いて開始ボタンを押し、
+既存の高速自動進行（lifeistech_auto.run_lesson）で完了まで進める。
+完了は API の status が cleared になったことで確認する。
+
+使い方:
+    uv run python auto_runner.py             # config.py の設定で実行
+    uv run python auto_runner.py --dry-run   # 対象一覧だけ表示
+    uv run python auto_runner.py --max 1     # 1 本だけ
+"""
+
+import argparse
+import sys
+import time
+
+import config
+from chrome_session import ChromeSession
+from lifeistech_auto import log, run_lesson
+from member_api import (
+    STATUS_CLEARED,
+    AuthError,
+    MemberApi,
+    MemberApiError,
+    find_course,
+    iter_lessons,
+)
+from work_automation import run_work
+
+LESSON_BUTTONS = ", ".join(
+    [
+        config.SEL_LESSON_START_BTN,
+        config.SEL_LESSON_RESUME_BTN,
+        config.SEL_LESSON_RESTART_BTN,
+    ]
+)
+
+
+def safe_url(page):
+    try:
+        return page.url
+    except Exception:
+        return ""
+
+
+def screenshot(page, tag):
+    path = f"/tmp/lifeistech_stop_{tag}.png"
+    try:
+        page.screenshot(path=path)
+        log(f"画面のスクリーンショットを保存しました: {path}")
+    except Exception:
+        pass
+
+
+def goto_lesson_page(page, target):
+    try:
+        page.goto(
+            target.page_url(),
+            wait_until="domcontentloaded",
+            timeout=int(config.LESSON_PAGE_READY_TIMEOUT * 1000),
+        )
+        return True
+    except Exception as e:
+        log(f"レッスン画面を開けませんでした: {e}")
+        return False
+
+
+def choose_start_button(page):
+    """表示されている開始系ボタンを優先順で選ぶ。"""
+    for selector in (
+        config.SEL_LESSON_START_BTN,
+        config.SEL_LESSON_RESUME_BTN,
+        config.SEL_LESSON_RESTART_BTN,
+    ):
+        try:
+            locator = page.locator(selector)
+            if locator.count() > 0 and locator.first.is_visible():
+                return selector
+        except Exception:
+            continue
+    return None
+
+
+def current_url(page):
+    """page.url が遷移に追随しないことがあるので、DOM からも現在 URL を取る。"""
+    url = safe_url(page)
+    try:
+        return page.evaluate("() => location.href") or url
+    except Exception:
+        return url
+
+
+def click_button(page, selector):
+    try:
+        from human_utils import human_click
+
+        human_click(page.locator(selector).first, base_delay=0)
+        return True
+    except Exception as e:
+        log(f"ボタンを押せませんでした: {e}")
+        return False
+
+
+def click_and_wait(context, page, selector, marker, timeout):
+    """ボタンを押し、同一タブ／新規タブどちらでも遷移先ページを返す。"""
+    before = set(context.pages)
+    if not click_button(page, selector):
+        return None
+
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        for candidate in context.pages:
+            if candidate in before:
+                continue
+            if marker in safe_url(candidate):
+                return candidate
+        if marker in current_url(page):
+            return page
+        time.sleep(0.2)
+    return None
+
+
+def pick_player_link(detail, selector):
+    """押したボタンに合わせて、開くべきプレイヤーの URL を API から選ぶ。"""
+    if selector == config.SEL_LESSON_RESUME_BTN:
+        link = detail.get("continue_link") or {}
+        if link.get("player_url"):
+            return link["player_url"]
+    links = detail.get("start_links") or []
+    if links:
+        return links[0].get("player_url")
+    return None
+
+
+def wait_for_player(api, context, page, target, selector, timeout=None):
+    """開始ボタン押下後、プレイヤーのページを返す。
+
+    レッスン画面はクリック後に受講レコードを作ってから遷移するため、
+    API の status が started になるのを待って遷移先 URL を取得する。
+    タブが遷移したことを URL で検知できない場合（page.url が追随しない
+    ことがある）は、取得した URL へ直接移動する。
+    """
+    timeout = config.LESSON_PAGE_READY_TIMEOUT if timeout is None else timeout
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        for candidate in context.pages:
+            if config.LESSON_PAGE_MARKER in safe_url(candidate):
+                return candidate
+        if config.LESSON_PAGE_MARKER in current_url(page):
+            return page
+
+        detail = None
+        try:
+            detail = api.lesson(target.chapter_id, target.lesson_id) or {}
+        except AuthError:
+            raise
+        except MemberApiError:
+            detail = None
+        if detail:
+            status = (detail.get("player_lesson") or {}).get("status")
+            if status in ("started", STATUS_CLEARED):
+                link = pick_player_link(detail, selector)
+                if link:
+                    try:
+                        page.goto(
+                            link,
+                            wait_until="domcontentloaded",
+                            timeout=int(timeout * 1000),
+                        )
+                        return page
+                    except Exception as e:
+                        log(f"プレイヤーを開けませんでした: {e}")
+                        return None
+        time.sleep(0.5)
+    return None
+
+
+def wait_for_cleared(api, target, timeout):
+    """API の status が cleared になるまで待つ。"""
+    end = time.monotonic() + timeout
+    last_status = None
+    while time.monotonic() < end:
+        try:
+            detail = api.lesson(target.chapter_id, target.lesson_id) or {}
+            last_status = (detail.get("player_lesson") or {}).get("status")
+            if last_status == STATUS_CLEARED:
+                return True
+        except AuthError:
+            raise
+        except MemberApiError as e:
+            last_status = str(e)
+        time.sleep(1.0)
+    log(f"クリアを確認できませんでした（status={last_status}）。")
+    return False
+
+
+def resume_url(api, target):
+    try:
+        detail = api.lesson(target.chapter_id, target.lesson_id) or {}
+    except MemberApiError:
+        return None
+    return (detail.get("continue_link") or {}).get("player_url")
+
+
+def run_checkwork(context, page, target):
+    """レッスン完了後に理解度チェックワークを 1 回だけ解く。"""
+    log("理解度チェックワークを開始します。")
+    if not goto_lesson_page(page, target):
+        return False
+    try:
+        page.wait_for_selector(
+            config.SEL_LESSON_CHECKWORK_BTN,
+            timeout=int(config.LESSON_PAGE_READY_TIMEOUT * 1000),
+        )
+    except Exception as e:
+        log(f"チェックワークのボタンが見つかりません: {e}")
+        return False
+
+    work_page = click_and_wait(
+        context,
+        page,
+        config.SEL_LESSON_CHECKWORK_BTN,
+        config.WORK_PAGE_MARKER,
+        config.LESSON_PAGE_READY_TIMEOUT,
+    )
+    if work_page is None:
+        log("チェックワーク画面へ遷移できませんでした。")
+        screenshot(page, f"checkwork_{target.lesson_id}")
+        return False
+
+    try:
+        ok = run_work(work_page)
+    finally:
+        if work_page is not page and not work_page.is_closed():
+            work_page.close()
+    log("チェックワークを採点しました。" if ok else "チェックワークを完了できませんでした。")
+    return ok
+
+
+def run_one(api, context, page, target, index, total):
+    log("")
+    log(f"[{index}/{total}] {target.name} ({target.status})")
+    started = time.monotonic()
+
+    if not goto_lesson_page(page, target):
+        screenshot(page, target.lesson_id)
+        return False
+
+    try:
+        page.wait_for_selector(
+            LESSON_BUTTONS, timeout=int(config.LESSON_PAGE_READY_TIMEOUT * 1000)
+        )
+    except Exception:
+        log("レッスン開始ボタンが見つかりません。既に完了している可能性があります。")
+        screenshot(page, f"no_button_{target.lesson_id}")
+        return False
+
+    selector = choose_start_button(page)
+    if selector is None:
+        log("押せる開始ボタンがありません。")
+        screenshot(page, f"no_clickable_{target.lesson_id}")
+        return False
+    if selector == config.SEL_LESSON_RESTART_BTN and not config.AUTO_RESTART_PARTIAL:
+        log("途中まで進んだレッスンですが、最初からやり直す設定になっていません。")
+        return False
+
+    if not click_button(page, selector):
+        screenshot(page, f"click_failed_{target.lesson_id}")
+        return False
+
+    player = wait_for_player(api, context, page, target, selector)
+    if player is None:
+        log("レッスンプレイヤーを開けませんでした。")
+        screenshot(page, f"no_player_{target.lesson_id}")
+        return False
+    log(f"プレイヤーを開きました: {safe_url(player)}")
+
+    try:
+        run_lesson(player)
+
+        if wait_for_cleared(api, target, config.AUTO_CLEAR_WAIT_SEC):
+            log(f"レッスンをクリアしました（{time.monotonic() - started:.1f} 秒）。")
+            if config.AUTO_RUN_CHECKWORK:
+                run_checkwork(context, page, target)
+            return True
+
+        url = resume_url(api, target)
+        if not url:
+            log("未クリアですが再開リンクがありません。停止します。")
+            return False
+        log("未クリアのため、続きからもう一度だけ実行します。")
+        try:
+            player.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            log(f"再開リンクを開けませんでした: {e}")
+            return False
+        run_lesson(player)
+        if wait_for_cleared(api, target, config.AUTO_CLEAR_WAIT_SEC):
+            log(f"レッスンをクリアしました（{time.monotonic() - started:.1f} 秒）。")
+            if config.AUTO_RUN_CHECKWORK:
+                run_checkwork(context, page, target)
+            return True
+        screenshot(player, f"not_cleared_{target.lesson_id}")
+        return False
+    finally:
+        if player is not page and not player.is_closed():
+            player.close()
+
+
+def print_targets(course, targets, scope):
+    log(
+        f"コース「{course.get('name')}」/ 範囲: {scope} / "
+        f"未完了レッスン: {len(targets)} 件"
+    )
+    for index, target in enumerate(targets, 1):
+        log(f"{index:2d}. {target.name} ({target.status})")
+        log(f"    {target.page_url()}")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="未完了レッスンを自動選択して連続実行します。"
+    )
+    parser.add_argument(
+        "--dry-run",
+        "--list",
+        dest="dry_run",
+        action="store_true",
+        help="対象レッスンの一覧だけ表示して終了する",
+    )
+    parser.add_argument("--course", help="コース名（既定: config.AUTO_COURSE_NAME）")
+    parser.add_argument(
+        "--scope",
+        choices=("chapter", "course"),
+        help="chapter: 最初の未完了を含む章だけ / course: コース全体",
+    )
+    parser.add_argument("--chapter", help='章の絞り込み（例: "第5章"）')
+    parser.add_argument("--max", type=int, help="実行するレッスン数の上限（0 で無制限）")
+    return parser.parse_args(argv)
+
+
+def apply_args(args):
+    if args.course:
+        config.AUTO_COURSE_NAME = args.course
+    if args.scope:
+        config.AUTO_SCOPE = args.scope
+    if args.chapter:
+        config.AUTO_CHAPTER_LABEL = args.chapter
+    limit = config.AUTO_MAX_LESSONS
+    if args.max is not None:
+        limit = args.max
+    return limit
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    limit = apply_args(args)
+
+    log("--- 未完了レッスンの自動実行を開始します ---")
+    session = ChromeSession()
+    exit_code = 1
+    try:
+        page = session.connect()
+        context = session.browser.contexts[0]
+        api = MemberApi(context)
+
+        course = find_course(api.textbook_courses(), config.AUTO_COURSE_NAME)
+        targets = iter_lessons(
+            api,
+            course,
+            scope=config.AUTO_SCOPE,
+            chapter_label=config.AUTO_CHAPTER_LABEL,
+        )
+        if limit:
+            targets = targets[:limit]
+
+        print_targets(course, targets, config.AUTO_SCOPE)
+        if args.dry_run:
+            exit_code = 0
+            return exit_code
+        if not targets:
+            log("未完了のレッスンはありません。すべて完了しています。")
+            exit_code = 0
+            return exit_code
+
+        failed = None
+        for index, target in enumerate(targets, 1):
+            if not run_one(api, context, page, target, index, len(targets)):
+                failed = target
+                break
+
+        log("")
+        if failed is None:
+            log(f"{len(targets)} 件のレッスンを完了しました。")
+            exit_code = 0
+        else:
+            log(f"「{failed.name}」で停止しました。原因を確認して再実行してください。")
+            exit_code = 1
+    except AuthError as e:
+        log(str(e))
+    except MemberApiError as e:
+        log(f"API エラー: {e}")
+    except KeyboardInterrupt:
+        log("処理を中断しました。")
+        exit_code = 130
+    finally:
+        session.close()
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

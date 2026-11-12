@@ -128,31 +128,39 @@ def go_next(page):
     return False
 
 
+def run_work(page):
+    """開いている理解度チェックワークを採点まで進める。採点したら True。"""
+    try:
+        while True:
+            if click_if_present(page, config.SEL_WORK_GRADE_BTN, base_delay=2.0):
+                log("採点しました。")
+                return True
+
+            question_text = answer_question(page)
+            if question_text is None:
+                if click_if_present(page, config.SEL_WORK_GRADE_BTN, base_delay=2.0):
+                    log("採点しました。")
+                    return True
+                log("問題文を取得できなかったため終了します。")
+                return False
+
+            if not go_next(page):
+                log("遷移ボタンが見つからないため終了します。")
+                return False
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        log(f"エラーが発生したため終了します: {e}")
+        return False
+
+
 def solve_work():
     log("--- 理解度チェックワーク自動化を開始します ---")
     try:
         with ChromeSession() as page:
-            for _ in range(config.MAX_LOOP_ITERATIONS):
-                if click_if_present(page, config.SEL_WORK_GRADE_BTN, base_delay=2.0):
-                    log("採点しました。")
-                    return
-
-                question_text = answer_question(page)
-                if question_text is None:
-                    if click_if_present(page, config.SEL_WORK_GRADE_BTN, base_delay=2.0):
-                        log("採点しました。")
-                        return
-                    log("問題文を取得できなかったため終了します。")
-                    return
-
-                if not go_next(page):
-                    log("遷移ボタンが見つからないため終了します。")
-                    return
-            log("最大ループ回数に達したため終了します。")
+            run_work(page)
     except KeyboardInterrupt:
         log("処理を中断しました。")
-    except Exception as e:
-        log(f"エラーが発生したため終了します: {e}")
 
 
 if __name__ == "__main__":

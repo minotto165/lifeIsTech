@@ -13,6 +13,7 @@ import config
 MENU = {
     "1": ("レッスン自動化", "lifeistech_auto.py"),
     "2": ("理解度チェックワーク", "work_automation.py"),
+    "3": ("全自動（未完了レッスンを自動選択して連続実行）", "auto_runner.py"),
 }
 
 
@@ -93,8 +94,9 @@ def choose_mode():
     for key, (label, _) in MENU.items():
         print(f"{key}: {label}")
     print("0: 終了")
+    keys = "".join(sorted([*MENU.keys(), "0"]))
     try:
-        choice = input("選択してください (0/1/2): ").strip()
+        choice = input(f"選択してください ({keys}): ").strip()
     except EOFError:
         return None
     return choice
