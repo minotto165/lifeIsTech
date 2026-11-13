@@ -2,6 +2,7 @@
 
 from playwright.sync_api import sync_playwright
 
+import browser
 import config
 
 
@@ -23,6 +24,8 @@ class ChromeSession:
         self.url_marker = url_marker
 
     def connect(self):
+        # Chrome が起動していなければここで起動する（各スクリプトを単体で実行しても動く）。
+        browser.ensure_chrome_running()
         self._playwright = sync_playwright().start()
         try:
             self.browser = self._playwright.chromium.connect_over_cdp(config.CDP_ENDPOINT)
@@ -34,6 +37,10 @@ class ChromeSession:
             if config.APPLY_WEBDRIVER_PATCH:
                 context.add_init_script(config.WEBDRIVER_PATCH)
             self.page = self._select_page(context)
+            # 空タブで起動した場合はホームを開き、セッションが切れていれば
+            # ログイン画面になるので手動ログインを待つ。
+            browser.open_home_if_blank(self.page)
+            self.page = browser.wait_for_login(self.page)
             return self.page
         except Exception:
             self.close()

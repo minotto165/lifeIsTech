@@ -2,14 +2,30 @@
 
 import os
 
+from dotenv import load_dotenv
+
+# .env を先に読み込む（各スクリプトは config を最初に import するため）
+load_dotenv()
+
 # --- Chrome / CDP ---
 # 9222 は他のツール（DSH の内蔵ブラウザ等）が使っていることがあるため、
 # 既定を 9300 にして環境変数で差し替えられるようにしている。
 CHROME_DEBUG_PORT = int(os.environ.get("LIFEISTECH_CHROME_PORT", "9300"))
 CDP_ENDPOINT = f"http://127.0.0.1:{CHROME_DEBUG_PORT}"
-CHROME_PROFILE_DIR = "chrome_profile"
+# 起動する Chrome のプロファイル（ログイン状態はここに残る）
+CHROME_PROFILE_DIR = os.environ.get("LIFEISTECH_CHROME_PROFILE", "chrome_profile")
+# ヘッドレスで起動する（LIFEISTECH_HEADLESS=1）。画面は出ないが CDP 操作は同じ。
+# 手動ログインができないので、セッション切れ対策に .env の ID / パスワードを推奨。
+HEADLESS = os.environ.get("LIFEISTECH_HEADLESS", "0") not in ("0", "", "false", "False")
 CHROME_STARTUP_TIMEOUT = 20.0
 LESSON_HOME_URL = "https://member.lifeistech-lesson.jp/home"
+# ログイン画面（b2clogin.com）だったときに、手動ログインを待つ上限（秒）
+LOGIN_WAIT_SEC = float(os.environ.get("LIFEISTECH_LOGIN_WAIT", "300"))
+# ログイン済み判定に使うセッション cookie（member_api.py と共通）
+SESSION_COOKIE_NAME = "mozermovie"
+# .env に書くとログイン画面で自動入力する（未設定なら手動ログインを待つ）
+LIFEISTECH_ID = os.environ.get("LIFEISTECH_ID", "")
+LIFEISTECH_PASSWORD = os.environ.get("LIFEISTECH_PASSWORD", "")
 
 # --- AI ---
 # "opencode_go" か "gemini"。opencode_go はキー不足・認証失敗時に gemini へ落ちる。
@@ -65,6 +81,13 @@ SEL_IMAGE_QUIZ_MODAL = ".image-select-quiz-element"
 SEL_IMAGE_QUIZ_CHOICE = ".image-select-quiz-element .quiz-button"
 # Enter 連打の間隔。0 で最速（待機なし）。
 ENTER_SPAM_DELAY = 0.0
+# 条件待ちのポーリング間隔（秒）。固定 sleep で待たず、状態が変わるまで
+# この間隔で 1 往復の JS を投げ、「押せる／進んだ」瞬間に次の動作へ移る。
+FAST_POLL_SEC = 0.01
+# 画面遷移（タブが現れる・プレイヤーが描画される）待ちの間隔（秒）。
+NAV_POLL_SEC = 0.05
+# 会員 API のポーリング間隔（秒）。サーバー負荷を考えて DOM より長めにする。
+API_POLL_SEC = 0.25
 # 同じステップで進行ボタンを押し直すまでの最短間隔（秒）。
 # 押した直後はまだ反応していないことがあるため、少し置いて再度押す。
 ACTION_RECLICK_DELAY = 0.15
@@ -91,6 +114,10 @@ FINISH_URL_MARKERS = ("/finish", "#finish", "lesson_finish")
 QUIZ_FEEDBACK_WAIT = 4.0
 # クイズを閉じるために Enter を送り続ける上限（秒）。
 QUIZ_CLOSE_TIMEOUT = 1.5
+# クイズを閉じるとき、次の Enter を送るまでの最長間隔（秒）。
+# 閉じたかどうかは FAST_POLL_SEC 間隔で見るので、これは「反応が無いときの再送間隔」。
+# 正解表示とモーダルの 2 段階で閉じるため、間隔を空けるとその分だけ待たされる。
+QUIZ_ENTER_INTERVAL = 0.01
 # クイズが「disabled のみ・chosen なし」で固まったまま何秒続いたらページ再読込で復帰するか。
 BROKEN_QUIZ_WAIT = 2.5
 # アニメーション待ち（既定 900ms の CSS トランジション）を飛ばす。
@@ -102,6 +129,9 @@ SKIP_ANIMATION_WAIT = True
 SEL_WORK_QUESTION = "span.css-mzz7lz"
 SEL_WORK_OPTION_LABEL = "label"
 SEL_WORK_GRADE_BTN = 'button:has-text("この内容で採点する")'
+GRADE_BTN_TEXT = "この内容で採点する"
+# 同じ問題文と選択肢の組は AI に聞き直さずキャッシュを使う（2 回目以降が速い）。
+WORK_ANSWER_CACHE = ".cache/work_answers.json"
 SEL_WORK_NEXT_BTN = 'button:has-text("次へ進む")'
 SEL_WORK_CONFIRM_BTN = 'button:has-text("解答内容を確認"), button:has-text("解答確認へ")'
 WORK_QUESTION_INDEX = 1
@@ -134,8 +164,11 @@ AUTO_RESTART_PARTIAL = True
 AUTO_CLEAR_WAIT_SEC = 30.0
 # レッスン画面のボタンが描画されるまで待つ上限（秒）。
 LESSON_PAGE_READY_TIMEOUT = 30.0
-# レッスン完了後に理解度チェックワークも続けて解く。
-AUTO_RUN_CHECKWORK = False
+# レッスン完了後に理解度チェックワークも続けて解く（設問はランダムなので AI で回答）。
+# CLI の --checkwork / --no-checkwork で上書きできる。
+AUTO_RUN_CHECKWORK = True
+# チェックワークで設問が切り替わるまで待つ上限（秒）。
+WORK_STEP_TIMEOUT = 5.0
 
 # レッスン画面（member ドメイン）のボタン。素の <button> で描画される。
 SEL_LESSON_START_BTN = 'button:has-text("レッスンスタート")'
@@ -177,10 +210,10 @@ CLICK_WAIT_SEC = 2.5
 CLICK_RETRY_WAIT_SEC = 0.8
 # confirm-button 以外のクリック課題は、見つからなくても Enter で進めるので短く打ち切る（秒）。
 CLICK_SHORT_WAIT_SEC = 0.2
-# クリック課題の要素を探す間隔（秒）。1 回の照会で全候補を見るので短くてよい。
-CLICK_POLL_SEC = 0.02
 CODE_MAX_ATTEMPTS = 5
-CODE_CHECK_INTERVAL = 0.2
+# コード課題のエディタはステップ遷移直後まだ操作できないことがあるため、
+# 使えるようになるまで待つ（この待ちが無いと 0 秒で失敗して諦めてしまう）。
+CODE_EDITOR_READY_TIMEOUT = 5.0
 # 解答を入力してから自動検証が返るのを待つ時間（秒）。
 # 実測では自動検証はほぼ返らない（毎回「コードチェック」を押すことになる）ので短くした。
 CODE_AUTO_VALIDATE_WAIT = 0.15
