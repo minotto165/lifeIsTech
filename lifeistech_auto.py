@@ -13,6 +13,7 @@ import sys
 import time
 
 import config
+import ui
 from ai_analyzer import get_ai_response
 from chrome_session import ChromeSession
 from human_utils import human_click, human_sleep
@@ -20,7 +21,8 @@ from instance_guard import acquire as acquire_instance
 
 
 def log(message):
-    print(message, flush=True)
+    # 色分けは ui 側で行う（rich が無い環境では素の print にフォールバック）。
+    ui.log(message)
 
 
 def count(page, selector):
@@ -58,14 +60,17 @@ def normalize(text):
 
 
 def wait_for_step_change(page, before, timeout):
-    """ステップが before から変わるまで最大 timeout 秒待つ。変われば True。"""
+    """ステップが before から変わるまで最大 timeout 秒待つ。変われば True。
+
+    固定 sleep ではなく、変わった瞬間に戻る条件待ち。timeout は上限としてだけ使う。
+    """
     deadline = time.monotonic() + timeout
     while True:
         if current_step(page) != before:
             return True
         if time.monotonic() >= deadline:
             return False
-        human_sleep(0.05)
+        time.sleep(config.FAST_POLL_SEC)
 
 
 def step_key(step):
@@ -252,6 +257,13 @@ def build_code_tasks(scenario):
     for step in scenario.get("steps", []):
         for element in step.get("elementList", []):
             if element.get("elementName") != "EditorModalElement":
+                continue
+            # 入力する課題はサーバー検証（ValidationFinish）が付いている。
+            # 付いていないものは「お手本のコードを見せるだけ」のステップなので
+            # 入力しない（読み取り専用のエディタを掴んで待つだけになる）。
+            if "ValidationFinish" not in json.dumps(
+                step.get("exitCondition") or {}, ensure_ascii=False
+            ):
                 continue
             correct = (element.get("content") or {}).get("correct") or {}
             codes = correct.get("codes") or []
@@ -463,7 +475,7 @@ def click_step(page, targets, wait_sec=None):
             found = None
         if found or time.monotonic() >= deadline:
             break
-        time.sleep(config.CLICK_POLL_SEC)
+        time.sleep(config.FAST_POLL_SEC)
     if not found:
         names = ", ".join(t.get("domId", "?") for t in targets)
         log(f"クリックできる要素が見つかりませんでした: {names}")
@@ -538,7 +550,7 @@ def preview_frame(page, timeout=None):
                         return frame
         except Exception:
             pass
-        human_sleep(0.1)
+        time.sleep(config.FAST_POLL_SEC)
     return None
 
 
@@ -593,7 +605,7 @@ def preview_script_text(frame):
 
 def _preview_click(frame, selector):
     frame.locator(selector).first.click(timeout=2_000)
-    human_sleep(0.3)
+    time.sleep(config.FAST_POLL_SEC)
 
 
 def solve_preview_interaction(frame, page, script):
@@ -612,7 +624,7 @@ def solve_preview_interaction(frame, page, script):
             frame.evaluate("() => window.scrollTo(0, 0)")
             for _ in range(60):
                 frame.evaluate("() => window.scrollBy(0, 160)")
-                human_sleep(0.08)
+                time.sleep(config.FAST_POLL_SEC)
             return True
         except Exception as e:
             log(f"プレビューのスクロールに失敗しました: {e}")
@@ -625,7 +637,7 @@ def solve_preview_interaction(frame, page, script):
             order = [int(x) for x in answer.group(1).split(",") if x.strip()]
             for index in order:
                 frame.locator("li.some-item").nth(index).click(timeout=2_000)
-                human_sleep(0.3)
+                time.sleep(config.FAST_POLL_SEC)
             return True
         except Exception as e:
             log(f"プレビューの順番クリックに失敗しました: {e}")
@@ -725,7 +737,7 @@ def apply_preview_task(page):
             rules = []
         if rules:
             break
-        human_sleep(0.2)
+        time.sleep(config.FAST_POLL_SEC)
     if frame is None:
         log("プレビューのフレームが見つかりませんでした。")
         return False, True
@@ -741,12 +753,12 @@ def apply_preview_task(page):
         try:
             cell = frame.locator(selector).first
             cell.dblclick(timeout=2_000)
-            human_sleep(0.05)
+            time.sleep(config.FAST_POLL_SEC)
             editor = frame.locator(selector + " input").first
             editor.fill(rule["value"], timeout=2_000)
             editor.press("Enter")
             applied += 1
-            human_sleep(0.2)
+            time.sleep(config.FAST_POLL_SEC)
         except Exception as e:
             log(f"セルへの入力に失敗しました（{selector}）: {e}")
     return applied > 0, True
@@ -884,13 +896,6 @@ def ask_ai(question, options):
     return get_ai_response(prompt)
 
 
-def read_quiz_question(page):
-    try:
-        return page.locator(config.SEL_QUIZ_TEXT).first.inner_text().strip()
-    except Exception:
-        return ""
-
-
 def has_chosen(page):
     return count(page, config.SEL_QUIZ_BUTTON + ".chosen") > 0
 
@@ -901,25 +906,13 @@ def wait_for_chosen(page, timeout=1.0):
     while time.monotonic() < end:
         if has_chosen(page):
             return True
-        human_sleep(0.02)
+        time.sleep(config.FAST_POLL_SEC)
     return False
 
 
 def quiz_open(page):
     """通常クイズ・画像選択クイズのどちらかが開いているか。"""
     return count(page, config.SEL_QUIZ_MODAL) + count(page, config.SEL_IMAGE_QUIZ_MODAL) > 0
-
-
-def wait_for_quiz_change(page, prev_question, timeout=2.0):
-    """回答後、モーダルが閉じるか次の問題に切り替わるまで待つ。"""
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        if not quiz_open(page):
-            return True
-        if normalize(read_quiz_question(page)) != prev_question:
-            return True
-        human_sleep(0.02)
-    return False
 
 
 # body 全体の正規表現だと問題文に「正解」を含むだけで誤検知する。
@@ -960,23 +953,49 @@ def wait_for_feedback(page, timeout=None):
     while time.monotonic() < end:
         if has_feedback(page):
             return True
-        human_sleep(0.05)
+        time.sleep(config.FAST_POLL_SEC)
     return False
 
 
+# クイズが閉じたか（モーダルが消えたか）を 1 往復で見る。
+QUIZ_CLOSE_JS = r"""() => {
+    const open = !!(document.querySelector('%(quiz)s') || document.querySelector('%(image_quiz)s'));
+    const text = document.querySelector('%(quiz_text)s');
+    return {open: open, question: text ? (text.textContent || '').trim() : ''};
+}"""
+
+
 def close_quiz(page, prev_question, timeout=None):
-    """Enter を短い間隔で送り続けてクイズを閉じる。
+    """クイズが閉じるまで Enter を送り続ける。
 
     正解表示のウィンドウとモーダル本体の 2 段階で閉じるため Enter 1 回では
-    閉じきらない。1 回送って 0.15 秒待つ、を繰り返すと 1 問あたり 1 秒以上
-    無駄になるので、閉じるまで短い間隔で送り続ける（押しても回答済みの
-    モーダルは disabled なので、誤って別の選択肢を選ぶことはない）。
+    閉じきらない。固定間隔で待たず、閉じたかを 1 往復の JS で見ながら
+    閉じた瞬間に戻る（押しても回答済みのモーダルは disabled なので、
+    誤って別の選択肢を選ぶことはない）。
     """
     deadline = time.monotonic() + (config.QUIZ_CLOSE_TIMEOUT if timeout is None else timeout)
+    js = QUIZ_CLOSE_JS % {
+        "quiz": config.SEL_QUIZ_MODAL,
+        "image_quiz": config.SEL_IMAGE_QUIZ_MODAL,
+        "quiz_text": config.SEL_QUIZ_TEXT,
+    }
     while True:
         press_enter(page)
-        if wait_for_quiz_change(page, prev_question, timeout=0.05):
-            return True
+        # 1 回の Enter が処理されるまで見て、閉じたら即戻る。
+        # 閉じなければ次の Enter を送る（押し過ぎても回答済みなので安全）。
+        probe_until = min(deadline, time.monotonic() + config.QUIZ_ENTER_INTERVAL)
+        while True:
+            try:
+                state = page.evaluate(js) or {}
+            except Exception:
+                state = {}
+            if not state.get("open"):
+                return True
+            if normalize(state.get("question") or "") != normalize(prev_question or ""):
+                return True
+            if time.monotonic() >= probe_until:
+                break
+            time.sleep(config.FAST_POLL_SEC)
         if time.monotonic() >= deadline:
             return False
 
@@ -1006,7 +1025,7 @@ def handle_quiz(page, answers, state=None):
         # まだ答えていない問題。選択肢を選ぶところからやり直す。
         labels = state.get("quiz_choices") or []
         if not labels:
-            human_sleep(0.05)
+            # まだ描画されていない。次の周回（数 ms 後）で読み直す。
             return
 
         correct = answers["by_text"].get(key[1]) or answers["by_step"].get(step)
@@ -1015,7 +1034,6 @@ def handle_quiz(page, answers, state=None):
             index = find_choice_index(labels, ask_ai(question, labels))
         if index is None:
             log(f"クイズの正解を特定できませんでした（step {step}）。次の周回で再試行します。")
-            human_sleep(0.2)
             return
 
         # まず JS クリック（1 往復）。反映されなければ実クリックで押し直す。
@@ -1070,18 +1088,15 @@ def handle_image_quiz(page, image_answers, state=None):
         info = image_answers["by_text"].get(key[1]) or image_answers["by_step"].get(step)
         if not info:
             log(f"画像選択クイズの正解を特定できませんでした（step {step}）。")
-            human_sleep(0.2)
             return
         try:
             index = info["labels"].index(info["correct"])
         except ValueError:
             log(f"画像選択クイズの選択肢番号が不正です（step {step}）。")
-            human_sleep(0.2)
             return
 
         if (state.get("image_quiz_count") or 0) <= index:
             log(f"画像選択クイズの選択肢が見つかりません（step {step}）。")
-            human_sleep(0.2)
             return
         click_nth(page, config.SEL_IMAGE_QUIZ_CHOICE, index)
         if not wait_for_chosen(page, timeout=0.25):
@@ -1221,21 +1236,26 @@ REPLACE_CODE_JS = r"""({file, text}) => {
     const all = [...document.querySelectorAll('%(editor)s')].filter(visible);
     const el = all.find((e) => e.className.includes(modeOf))
         || all.find((e) => e.env && e.env.editor && !e.env.editor.getReadOnly());
-    if (!el || !el.env || !el.env.editor) return false;
+    if (!el || !el.env || !el.env.editor) return {ok: false, reason: 'editor-not-found'};
     const editor = el.env.editor;
-    if (editor.getReadOnly()) return false;
+    if (editor.getReadOnly()) return {ok: false, reason: 'readonly'};
     // 「:」や「{」の自動インデントで行がずれるため、置換でも無効にしておく。
     editor.setOptions({behavioursEnabled: false});
     editor.focus();
-    const Range = (window.ace && window.ace.require)
-        ? window.ace.require('ace/range').Range
-        : null;
-    if (!Range) return false;
-    editor.session.replace(
-        new Range(0, 0, editor.session.getLength(), 0),
-        text,
-    );
-    return true;
+
+    // Range クラスの入手経路は環境によって変わる（window.ace が無いビルドもある）。
+    let Range = null;
+    try {
+        Range = (window.ace && window.ace.require) ? window.ace.require('ace/range').Range : null;
+    } catch (e) { Range = null; }
+    if (Range) {
+        editor.session.replace(new Range(0, 0, editor.session.getLength(), 0), text);
+        return {ok: true, via: 'range'};
+    }
+    // Range が取れないときは setValue（Ace の change イベントは発火する）。
+    editor.setValue(text, -1);
+    editor.clearSelection();
+    return {ok: true, via: 'setValue'};
 }"""
 
 
@@ -1251,15 +1271,18 @@ def replace_code_whole(page, file_name, codes):
         return False
     text = "\n".join(c.get("sentence") or "" for c in lines)
     try:
-        return bool(
-            page.evaluate(
-                REPLACE_CODE_JS % {"editor": config.SEL_CODE_EDITOR},
-                {"file": file_name, "text": text},
-            )
+        result = page.evaluate(
+            REPLACE_CODE_JS % {"editor": config.SEL_CODE_EDITOR},
+            {"file": file_name, "text": text},
         )
     except Exception as e:
         log(f"エディタ全体の置換に失敗しました: {e}")
         return False
+    if isinstance(result, dict) and result.get("ok"):
+        return True
+    reason = result.get("reason") if isinstance(result, dict) else result
+    log(f"エディタ全体の置換ができませんでした（{reason}）。1 行ずつ入力します。")
+    return False
 
 
 VERIFY_CODE_JS = r"""({file, expected}) => {
@@ -1310,13 +1333,33 @@ def apply_code_task(page, task):
 
     file_name = task.get("file", "")
     js = FOCUS_CODE_EDITOR_JS % {"editor": config.SEL_CODE_EDITOR}
-    try:
-        info = page.evaluate(js, {"file": file_name, "first": 0, "last": 0})
-    except Exception as e:
-        log(f"エディタの準備に失敗しました: {e}")
-        return False
-    if not info.get("ok"):
-        return False
+    # ステップ遷移直後はエディタがまだマウント中で操作できないことがある。
+    deadline = time.monotonic() + config.CODE_EDITOR_READY_TIMEOUT
+    # 読み取り専用のエディタしか無いステップは入力する課題ではないので、
+    # 短めに見切りをつける（それでも遷移直後に書き込み可能なエディタへ
+    # 差し替わることがあるため、すぐには諦めない）。
+    readonly_deadline = None
+    reason = None
+    while True:
+        try:
+            info = page.evaluate(js, {"file": file_name, "first": 0, "last": 0})
+        except Exception as e:
+            log(f"エディタの準備に失敗しました: {e}")
+            return False
+        if info.get("ok"):
+            break
+        reason = info.get("reason")
+        now = time.monotonic()
+        if reason == "readonly" and readonly_deadline is None:
+            readonly_deadline = now + 2.0
+        limit = deadline
+        if readonly_deadline is not None:
+            limit = min(limit, readonly_deadline)
+        if now >= limit:
+            if reason != "readonly":
+                log(f"エディタを操作できる状態になりませんでした（{reason}）。")
+            return False
+        time.sleep(config.FAST_POLL_SEC)
 
     before = current_step(page)
     # まずエディタ内をクリックしてフォーカスを移す（focus() だけでは
@@ -1335,8 +1378,6 @@ def apply_code_task(page, task):
     replaced = False
     if ext in ("py", "js"):
         replaced = replace_code_whole(page, file_name, codes)
-        if not replaced:
-            log("エディタ全体の置換ができなかったため、1 行ずつ入力します。")
 
     if not replaced:
         line_js = SELECT_CODE_LINE_JS % {"editor": config.SEL_CODE_EDITOR}
@@ -1389,39 +1430,88 @@ def apply_code_task(page, task):
         )
         return True
 
-    click_code_check(page)
-    if wait_for_step_change(page, before, config.CODE_CHECK_WAIT):
-        profile_log(
-            f"コード課題 step {before}: コードチェックで通過 入力後 {time.perf_counter() - staged:.2f} 秒"
-            f" / 合計 {time.perf_counter() - started:.2f} 秒"
-        )
-        return True
-
-    # 判定結果のウィンドウが出ていたら閉じる（閉じないとステップが進まない）。
-    closed_at = time.perf_counter()
-    close_code_result(page)
-    profile_log(f"コード課題 step {before}: 結果ウィンドウ {time.perf_counter() - closed_at:.2f} 秒")
-    if current_step(page) != before:
-        return True
-
-    # Python のレッスンは、正解の確認後に「実行」を押すまで進まない。
-    if click_run_button(page):
-        if wait_for_step_change(page, before, config.CODE_CHECK_WAIT):
+    checked_at = time.perf_counter()
+    checked = click_code_check(page)
+    # コードチェックを押すと判定結果のウィンドウが出る。開いている間はステップが
+    # 進まないので、開いた時点で閉じ、閉じたら「実行」を押す。閉じたあとも進まない
+    # レッスンがあるため、ステップ番号・ウィンドウ・実行ボタンを 1 往復で見ながら
+    # 必要な操作だけを最短で行う。
+    wait_js = CODE_WAIT_JS % {
+        "close": config.SEL_CODE_RESULT_CLOSE,
+        "run": config.SEL_CODE_RUN_BTN,
+    }
+    closed = False
+    ran = False
+    deadline = checked_at + config.CODE_CHECK_WAIT
+    while True:
+        try:
+            state = page.evaluate(wait_js) or {}
+        except Exception:
+            state = {}
+        step = step_key(state.get("step"))
+        if step is not None and step != before:
+            profile_log(
+                f"コード課題 step {before}: コードチェックで通過 入力後 {time.perf_counter() - staged:.2f} 秒"
+                f" / 合計 {time.perf_counter() - started:.2f} 秒"
+            )
             return True
+        if state.get("modal") and not closed:
+            close_code_result(page, timeout=0.5)
+            closed = True
+            profile_log(
+                f"コード課題 step {before}: 結果ウィンドウ "
+                f"{time.perf_counter() - checked_at:.2f} 秒で閉じました"
+            )
+            continue
+        if closed and not ran and state.get("run"):
+            ran = click_run_button(page, timeout=0.1)
+            continue
+        if time.perf_counter() >= deadline:
+            break
+        time.sleep(config.FAST_POLL_SEC)
+
+    profile_log(
+        f"コード課題 step {before}: 進みませんでした（コードチェック={checked} / 結果を閉じた={closed} / 実行={ran}）"
+    )
     return current_step(page) != before
 
 
-def click_run_button(page):
-    """エディタ横の「実行」を押す。無いレッスンでは何もしない。"""
-    button = page.locator(config.SEL_CODE_RUN_BTN).first
-    try:
-        if button.count() == 0 or not button.is_visible():
+def click_run_button(page, timeout=1.5):
+    """エディタ横の「実行」を押す。無いレッスンでは何もしない。
+
+    結果ウィンドウを閉じた直後は、まだボタンが隠れていることがあるので
+    表示されるまで少し待つ。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        button = page.locator(config.SEL_CODE_RUN_BTN).first
+        try:
+            if button.count() > 0 and button.is_visible():
+                button.evaluate("(el) => el.click()")
+                log("「実行」ボタンを押しました。")
+                return True
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
             return False
-        button.evaluate("(el) => el.click()")
-        log("「実行」ボタンを押しました。")
-        return True
-    except Exception:
-        return False
+        time.sleep(config.FAST_POLL_SEC)
+
+
+# ステップ番号と「結果ウィンドウが開いているか」を 1 往復で取る。
+CODE_WAIT_JS = r"""() => {
+  const step = new URLSearchParams(location.search).get('step_id');
+  const visible = (selector) => {
+    const el = document.querySelector(selector);
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  return {
+    step: step,
+    modal: visible('%(close)s'),
+    run: visible('%(run)s'),
+  };
+}"""
 
 
 def click_code_check(page):
@@ -1447,7 +1537,7 @@ def close_code_result(page, timeout=3.0):
                 return True
         except Exception:
             pass
-        human_sleep(0.2)
+        time.sleep(config.FAST_POLL_SEC)
     return False
 
 
@@ -1725,7 +1815,16 @@ def _run_lesson_loop(page):
         locked_since = None
         quiz_key = None
         quiz_since = None
-        human_sleep(0.5)
+        # 再読込直後はプレイヤーの描画を待つ。固定 sleep ではなく、
+        # レッスンページとして読めるようになった瞬間に先へ進む。
+        ready_deadline = time.monotonic() + config.LESSON_PAGE_READY_TIMEOUT
+        while time.monotonic() < ready_deadline:
+            try:
+                if read_state(page)["in_lesson"]:
+                    break
+            except Exception:
+                pass
+            time.sleep(config.NAV_POLL_SEC)
         if config.DISABLE_CSS_ANIMATION:
             install_animation_killer(page)
         if config.SHORTEN_LONG_TIMERS:
@@ -1764,7 +1863,10 @@ def _run_lesson_loop(page):
         except Exception as e:
             # レッスン完了時は SPA 遷移で実行コンテキストが破棄される。
             if "Execution context was destroyed" in str(e):
-                human_sleep(0.3)
+                # SPA 遷移中。完了画面に変わるまで条件待ちする。
+                finish_deadline = time.monotonic() + config.LESSON_PAGE_READY_TIMEOUT
+                while not lesson_finished(page) and time.monotonic() < finish_deadline:
+                    time.sleep(config.NAV_POLL_SEC)
                 if lesson_finished(page):
                     log_finish_speed(started_at, passed_steps)
                     return True
@@ -1893,7 +1995,7 @@ def _run_lesson_loop(page):
                 if apply_code_task(page, code_tasks[step]):
                     last_change = time.monotonic()
                 profile_log(f"コード課題 {time.perf_counter() - started_task:.2f} 秒（step {step}）")
-                human_sleep(config.CODE_CHECK_INTERVAL)
+                # 固定待機はしない。次の周回で状態を読み直す。
                 continue
             if tries == config.CODE_MAX_ATTEMPTS:
                 code_attempts[step] = tries + 1
@@ -1925,7 +2027,6 @@ def _run_lesson_loop(page):
             applied, supported = apply_preview_task(page)
             if applied:
                 last_change = time.monotonic()
-                human_sleep(0.3)
                 continue
             if not supported:
                 preview_unsupported.add(step)
