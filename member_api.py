@@ -107,7 +107,9 @@ def read_token(context):
     """ブラウザの cookie から API 用トークンを取り出す。"""
     try:
         cookies = context.cookies(MEMBER_ORIGIN) if context is not None else []
-    except Exception:
+    except Exception as e:
+        # 取得自体に失敗した場合と「cookie が無い」場合を区別できるようにする。
+        print(f"cookie の取得に失敗しました: {e}", flush=True)
         cookies = []
     for cookie in cookies:
         if cookie.get("name") == COOKIE_NAME and cookie.get("value"):
@@ -126,11 +128,12 @@ def find_course(courses, name):
     if not name:
         return courses[0]
     for course in courses:
-        if course.get("name") == name:
+        if (course.get("name") or "").strip() == name:
             return course
-    for course in courses:
-        if name in (course.get("name") or ""):
-            return course
+    # 部分一致で複数に当たるなら誤ったコースを選ぶほうが危険なので、一意なときだけ許す。
+    partial = [c for c in courses if name in (c.get("name") or "")]
+    if len(partial) == 1:
+        return partial[0]
     available = " / ".join(course.get("name") or "?" for course in courses)
     raise MemberApiError(
         f"コース「{name}」が見つかりません。利用できるコース: {available}"
@@ -173,10 +176,20 @@ def iter_lessons(api, course, scope="chapter", chapter_label=None):
     textbook_id = (course.get("textbook") or {}).get("id")
     targets = []
     for chapter in chapters:
-        detail = api.chapter(chapter.get("id")) or {}
+        detail = api.chapter(chapter.get("id"))
+        if detail is None:
+            # 404 を「未完了なし」として扱うと、黙ってコースを飛ばしてしまう。
+            raise MemberApiError(
+                f"章の詳細を取得できませんでした（chapter {chapter.get('id')}）。"
+                "ページを再読み込みしてから再実行してください。"
+            )
         detail = {**chapter, **detail}
         if not detail.get("textbook_id"):
             detail["textbook_id"] = textbook_id
+        if not detail.get("textbook_id"):
+            raise MemberApiError(
+                f"章 {chapter.get('id')} の textbook_id が分からず、レッスンページの URL を組み立てられません。"
+            )
         pending = []
         for lesson in detail.get("lessons") or []:
             target = to_target(detail, lesson)

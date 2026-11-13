@@ -89,7 +89,18 @@ def ask_opencode_go(prompt):
                 headers,
                 config.OPENCODE_GO_TIMEOUT_SEC,
             )
-            text = (data["choices"][0]["message"]["content"] or "").strip()
+            choices = data.get("choices") or []
+            if not choices:
+                print(
+                    f"OpenCode Go の応答に choices がありません ({attempt}/{attempts})",
+                    flush=True,
+                )
+                if attempt < attempts:
+                    time.sleep(attempt)
+                    continue
+                return None
+            message = choices[0].get("message") or {}
+            text = (message.get("content") or "").strip()
             return text or None
         except urllib.error.HTTPError as e:
             detail = ""
@@ -132,10 +143,11 @@ def _get_gemini_client():
     global _gemini_client, _gemini_initialized
     if _gemini_initialized:
         return _gemini_client
-    _gemini_initialized = True
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
+        # キーが無い状態は何度試しても変わらないので、以後は問い合わせない。
+        _gemini_initialized = True
         return None
 
     kwargs = {"api_key": api_key}
@@ -147,6 +159,10 @@ def _get_gemini_client():
     except Exception as e:
         print(f"Gemini クライアントの初期化に失敗しました: {e}", flush=True)
         _gemini_client = None
+        # 設定不備なら毎問リトライしても同じ結果になるため、ここで確定させる。
+        _gemini_initialized = True
+        return None
+    _gemini_initialized = True
     return _gemini_client
 
 

@@ -1,6 +1,12 @@
 __pycache__/
+*.pyc
 chrome_profile/
 .env
 .omo/
 .venv/
 .DS_Store
+
+# 実行時の生成物
+screenshots/
+.lifeistech.lock
+*.log

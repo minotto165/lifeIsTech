@@ -5,6 +5,14 @@ from playwright.sync_api import sync_playwright
 import config
 
 
+def safe_page_url(page):
+    """page.url が取れない（閉じた・遷移中）場合に備えた安全な取得。"""
+    try:
+        return page.url or "(about:blank)"
+    except Exception:
+        return "(不明)"
+
+
 class ChromeSession:
     """CDP 経由で既存 Chrome に接続し、操作対象のページを返す。"""
 
@@ -21,8 +29,10 @@ class ChromeSession:
             if not self.browser.contexts:
                 raise RuntimeError("Chrome にブラウザコンテキストが見つかりません")
             context = self.browser.contexts[0]
+            # 全タブに効く init script なので、明示的に有効化したときだけ入れる。
             # 既に読み込み済みのページには効かないが、以降の遷移から有効になる。
-            context.add_init_script(config.WEBDRIVER_PATCH)
+            if config.APPLY_WEBDRIVER_PATCH:
+                context.add_init_script(config.WEBDRIVER_PATCH)
             self.page = self._select_page(context)
             return self.page
         except Exception:
@@ -33,11 +43,21 @@ class ChromeSession:
         pages = context.pages
         if not pages:
             return context.new_page()
-        if self.url_marker:
-            for page in pages:
+        if not self.url_marker:
+            return pages[0]
+        for page in pages:
+            try:
                 if self.url_marker in page.url:
                     return page
-        return pages[0]
+            except Exception:
+                continue
+        # 目印の付いたタブが無いまま pages[0] を使うと、無関係なタブに
+        # キー入力やクリックを送ってしまうので、黙って続行しない。
+        urls = ", ".join(safe_page_url(page) for page in pages) or "(なし)"
+        raise RuntimeError(
+            f"{self.url_marker} を含むタブが見つかりません。"
+            f"Chrome で対象のページを開いてから実行してください。開いているタブ: {urls}"
+        )
 
     def close(self):
         # connect_over_cdp では browser.close() が Chrome 自体を終了させるため呼ばない。

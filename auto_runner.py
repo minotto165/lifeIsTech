@@ -12,11 +12,14 @@ Chrome に接続し、受講者 API からコース・章・レッスンの進�
 """
 
 import argparse
+import pathlib
 import sys
 import time
 
 import config
-from chrome_session import ChromeSession
+from chrome_session import ChromeSession, safe_page_url
+from human_utils import human_sleep
+from instance_guard import acquire as acquire_instance
 from lifeistech_auto import log, run_lesson
 from member_api import (
     STATUS_CLEARED,
@@ -38,19 +41,33 @@ LESSON_BUTTONS = ", ".join(
 
 
 def safe_url(page):
+    return safe_page_url(page)
+
+
+def prune_screenshots(directory, keep):
+    """古いスクリーンショットを消して、置き場所が膨らみ続けないようにする。"""
     try:
-        return page.url
+        shots = sorted(
+            directory.glob("*.png"), key=lambda item: item.stat().st_mtime, reverse=True
+        )
+        for old in shots[max(keep, 0) :]:
+            old.unlink()
     except Exception:
-        return ""
+        pass
 
 
 def screenshot(page, tag):
-    path = f"/tmp/lifeistech_stop_{tag}.png"
     try:
-        page.screenshot(path=path)
+        directory = pathlib.Path(config.SCREENSHOT_DIR)
+        # 画面にはログイン中の情報が写るため、所有者だけ読める権限で作る。
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = directory / f"stop_{stamp}_{tag}.png"
+        page.screenshot(path=str(path))
+        prune_screenshots(directory, config.SCREENSHOT_KEEP)
         log(f"画面のスクリーンショットを保存しました: {path}")
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"スクリーンショットを保存できませんでした: {e}")
 
 
 def goto_lesson_page(page, target):
@@ -95,7 +112,11 @@ def click_button(page, selector):
     try:
         from human_utils import human_click
 
-        human_click(page.locator(selector).first, base_delay=0)
+        human_click(
+            page.locator(selector).first,
+            base_delay=0,
+            timeout_ms=config.ACTION_CLICK_TIMEOUT_MS,
+        )
         return True
     except Exception as e:
         log(f"ボタンを押せませんでした: {e}")
@@ -121,34 +142,88 @@ def click_and_wait(context, page, selector, marker, timeout):
     return None
 
 
+def preferred_os():
+    """この環境で選ぶべき start_links の os 名。"""
+    if sys.platform == "darwin":
+        return "mac"
+    if sys.platform.startswith("win"):
+        return "win"
+    return "chromebook"
+
+
 def pick_player_link(detail, selector):
-    """押したボタンに合わせて、開くべきプレイヤーの URL を API から選ぶ。"""
+    """押したボタンに合わせて、開くべきプレイヤーの URL を API から選ぶ。
+
+    start_links は Windows / Mac / Chromebook / iPad の版が並ぶことがある。
+    先頭を鵜呑みにすると別 OS 向けの説明（キー操作が違う）を開くため、
+    この環境に合う os のリンクを優先する。
+    """
     if selector == config.SEL_LESSON_RESUME_BTN:
         link = detail.get("continue_link") or {}
         if link.get("player_url"):
             return link["player_url"]
-    links = detail.get("start_links") or []
-    if links:
-        return links[0].get("player_url")
-    return None
+    links = [
+        link for link in (detail.get("start_links") or []) if link.get("player_url")
+    ]
+    if not links:
+        return None
+    want = preferred_os()
+    for link in links:
+        if link.get("os") == want:
+            return link["player_url"]
+    for link in links:
+        if not link.get("os"):
+            return link["player_url"]
+    return links[0]["player_url"]
 
 
-def wait_for_player(api, context, page, target, selector, timeout=None):
+def choose_os_if_asked(page):
+    """OS 選択ダイアログが出ていれば、この環境に合う OS を選ぶ。"""
+    from human_utils import human_click
+
+    label = config.OS_CHOICE_LABELS.get(preferred_os())
+    if not label:
+        return False
+    try:
+        locator = page.get_by_role("button", name=label, exact=True)
+        if locator.count() == 0 or not locator.first.is_visible():
+            return False
+        button = locator.first
+        human_click(
+            button,
+            base_delay=0,
+            timeout_ms=config.ACTION_CLICK_TIMEOUT_MS,
+        )
+        log(f"端末の環境「{label}」を選びました。")
+        return True
+    except Exception:
+        return False
+
+
+def wait_for_player(api, context, page, target, selector, before, timeout=None):
     """開始ボタン押下後、プレイヤーのページを返す。
 
     レッスン画面はクリック後に受講レコードを作ってから遷移するため、
     API の status が started になるのを待って遷移先 URL を取得する。
     タブが遷移したことを URL で検知できない場合（page.url が追随しない
     ことがある）は、取得した URL へ直接移動する。
+    before はクリック前に開いていたページの集合。未完了レッスンの
+    プレイヤーを別タブに開いたままにしていると、それを今回の遷移先と
+    誤認して別レッスンを操作してしまうため、新しいタブだけを見る。
     """
     timeout = config.LESSON_PAGE_READY_TIMEOUT if timeout is None else timeout
     end = time.monotonic() + timeout
+    attempted = None
     while time.monotonic() < end:
         for candidate in context.pages:
+            if candidate in before:
+                continue
             if config.LESSON_PAGE_MARKER in safe_url(candidate):
                 return candidate
         if config.LESSON_PAGE_MARKER in current_url(page):
             return page
+        # EX① などは開始ボタンの後に「端末の環境を選択」が出る。
+        choose_os_if_asked(page)
 
         detail = None
         try:
@@ -161,17 +236,24 @@ def wait_for_player(api, context, page, target, selector, timeout=None):
             status = (detail.get("player_lesson") or {}).get("status")
             if status in ("started", STATUS_CLEARED):
                 link = pick_player_link(detail, selector)
-                if link:
+                if link and link != attempted:
+                    attempted = link
+                    remaining = max(end - time.monotonic(), 5.0)
                     try:
                         page.goto(
                             link,
                             wait_until="domcontentloaded",
-                            timeout=int(timeout * 1000),
+                            timeout=int(remaining * 1000),
                         )
                         return page
                     except Exception as e:
-                        log(f"プレイヤーを開けませんでした: {e}")
-                        return None
+                        # SPA 自身の遷移と競合すると
+                        # 「interrupted by another navigation」で goto が失敗する。
+                        # 遷移は進んでいるので URL を確かめて続行する。
+                        log(f"プレイヤーの遷移を待ちます: {e}")
+                        human_sleep(0.5)
+                        if config.LESSON_PAGE_MARKER in current_url(page):
+                            return page
         time.sleep(0.5)
     return None
 
@@ -238,6 +320,15 @@ def run_checkwork(context, page, target):
     return ok
 
 
+def lesson_unavailable(page):
+    """API には未完了で載っているのに、レッスンページが 404 のことがある。"""
+    try:
+        text = page.inner_text("body")
+    except Exception:
+        return False
+    return "対応レッスンはありません" in text or "404 Not Found" in text
+
+
 def run_one(api, context, page, target, index, total):
     log("")
     log(f"[{index}/{total}] {target.name} ({target.status})")
@@ -252,6 +343,9 @@ def run_one(api, context, page, target, index, total):
             LESSON_BUTTONS, timeout=int(config.LESSON_PAGE_READY_TIMEOUT * 1000)
         )
     except Exception:
+        if lesson_unavailable(page):
+            log("このレッスンは公開されていません（404）。スキップします。")
+            return True
         log("レッスン開始ボタンが見つかりません。既に完了している可能性があります。")
         screenshot(page, f"no_button_{target.lesson_id}")
         return False
@@ -265,11 +359,12 @@ def run_one(api, context, page, target, index, total):
         log("途中まで進んだレッスンですが、最初からやり直す設定になっていません。")
         return False
 
+    before = set(context.pages)
     if not click_button(page, selector):
         screenshot(page, f"click_failed_{target.lesson_id}")
         return False
 
-    player = wait_for_player(api, context, page, target, selector)
+    player = wait_for_player(api, context, page, target, selector, before)
     if player is None:
         log("レッスンプレイヤーを開けませんでした。")
         screenshot(page, f"no_player_{target.lesson_id}")
@@ -277,7 +372,8 @@ def run_one(api, context, page, target, index, total):
     log(f"プレイヤーを開きました: {safe_url(player)}")
 
     try:
-        run_lesson(player)
+        if not run_lesson(player):
+            log("レッスンの自動進行が正常終了しませんでした。クリア状況を確認します。")
 
         if wait_for_cleared(api, target, config.AUTO_CLEAR_WAIT_SEC):
             log(f"レッスンをクリアしました（{time.monotonic() - started:.1f} 秒）。")
@@ -295,7 +391,9 @@ def run_one(api, context, page, target, index, total):
         except Exception as e:
             log(f"再開リンクを開けませんでした: {e}")
             return False
-        run_lesson(player)
+        if not run_lesson(player):
+            log("再開後の自動進行も正常終了しませんでした。")
+
         if wait_for_cleared(api, target, config.AUTO_CLEAR_WAIT_SEC):
             log(f"レッスンをクリアしました（{time.monotonic() - started:.1f} 秒）。")
             if config.AUTO_RUN_CHECKWORK:
@@ -336,7 +434,13 @@ def parse_args(argv=None):
         help="chapter: 最初の未完了を含む章だけ / course: コース全体",
     )
     parser.add_argument("--chapter", help='章の絞り込み（例: "第5章"）')
+    parser.add_argument("--lesson", type=int, help="レッスン ID を指定してその 1 本だけ実行")
     parser.add_argument("--max", type=int, help="実行するレッスン数の上限（0 で無制限）")
+    parser.add_argument(
+        "--stop-on-failure",
+        action="store_true",
+        help="自動化できなかったレッスンで停止する（既定は記録して次へ進む）",
+    )
     return parser.parse_args(argv)
 
 
@@ -358,6 +462,8 @@ def main(argv=None):
     limit = apply_args(args)
 
     log("--- 未完了レッスンの自動実行を開始します ---")
+    if not acquire_instance():
+        return 1
     session = ChromeSession()
     exit_code = 1
     try:
@@ -372,6 +478,11 @@ def main(argv=None):
             scope=config.AUTO_SCOPE,
             chapter_label=config.AUTO_CHAPTER_LABEL,
         )
+        if args.lesson:
+            targets = [target for target in targets if target.lesson_id == args.lesson]
+            if not targets:
+                log(f"レッスン {args.lesson} は未完了の対象に含まれていません。")
+                return 1
         if limit:
             targets = targets[:limit]
 
@@ -384,19 +495,27 @@ def main(argv=None):
             exit_code = 0
             return exit_code
 
-        failed = None
+        failed = []
         for index, target in enumerate(targets, 1):
-            if not run_one(api, context, page, target, index, len(targets)):
-                failed = target
-                break
+            if run_one(api, context, page, target, index, len(targets)):
+                continue
+            failed.append(target)
+            if args.stop_on_failure:
+                log("")
+                log(f"「{target.name}」で停止しました。原因を確認して再実行してください。")
+                exit_code = 1
+                return exit_code
+            log(f"「{target.name}」は自動化できませんでした（未完了のまま次へ進みます）。")
 
+        done = len(targets) - len(failed)
         log("")
-        if failed is None:
-            log(f"{len(targets)} 件のレッスンを完了しました。")
-            exit_code = 0
-        else:
-            log(f"「{failed.name}」で停止しました。原因を確認して再実行してください。")
-            exit_code = 1
+        log(f"{done} 件のレッスンを完了しました。")
+        if failed:
+            log(f"自動化できなかったレッスン（{len(failed)} 件）:")
+            for target in failed:
+                log(f"  - {target.name} ({target.lesson_id})")
+            log("これらは手動で進めるか、原因を確認してから再実行してください。")
+        exit_code = 0
     except AuthError as e:
         log(str(e))
     except MemberApiError as e:
