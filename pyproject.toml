@@ -8,4 +8,5 @@ dependencies = [
     "google-genai==1.47.0",
     "playwright==1.60.0",
     "python-dotenv==1.2.1",
+    "rich>=15.0.0",
 ]
