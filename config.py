@@ -26,6 +26,10 @@ SESSION_COOKIE_NAME = "mozermovie"
 # .env に書くとログイン画面で自動入力する（未設定なら手動ログインを待つ）
 LIFEISTECH_ID = os.environ.get("LIFEISTECH_ID", "")
 LIFEISTECH_PASSWORD = os.environ.get("LIFEISTECH_PASSWORD", "")
+# ログイン画面（b2clogin.com）の入力欄と送信ボタン。browser.py から参照する。
+LOGIN_ID_SELECTOR = "#signInName"
+LOGIN_PASSWORD_SELECTOR = "#password"
+LOGIN_SUBMIT_SELECTOR = "#localAccountForm button[type=submit], #next"
 
 # --- AI ---
 # "opencode_go" か "gemini"。opencode_go はキー不足・認証失敗時に gemini へ落ちる。
@@ -144,6 +148,13 @@ WRONG_ANSWER_RATE = 0.0
 # ワーク 1 回あたりの最大設問数と、同じ問題が続いたときに諦める回数。
 MAX_WORK_STEPS = 200
 WORK_STALL_LIMIT = 5
+# 選択肢のクリックが反映される（選択済みになる）まで待つ上限（秒）。
+WORK_SELECT_TIMEOUT = 2.0
+# 設問（または採点ボタン）が描画されるまで待つ上限（秒）。
+WORK_READY_TIMEOUT = 10.0
+# ワーク画面そのものが開くまで待つ上限（秒）。
+# レッスン画面（LESSON_PAGE_READY_TIMEOUT）とは描画の内容が別物なので分けている。
+WORK_PAGE_READY_TIMEOUT = 30.0
 
 # --- 全自動 (auto_runner.py) ---
 # 受講者向け API。cookie `mozermovie` を Bearer トークンとして GET する。
@@ -169,6 +180,10 @@ LESSON_PAGE_READY_TIMEOUT = 30.0
 AUTO_RUN_CHECKWORK = True
 # チェックワークで設問が切り替わるまで待つ上限（秒）。
 WORK_STEP_TIMEOUT = 5.0
+# チェックワークの採点結果（「もう一度チャレンジする」）が出るまで待つ上限（秒）。
+CHECKWORK_GRADED_WAIT_SEC = 10.0
+# 未クリア時に再開リンクを開くときのページ読み込み待ち（ms）。
+RESUME_PAGE_GOTO_TIMEOUT_MS = 30000
 
 # レッスン画面（member ドメイン）のボタン。素の <button> で描画される。
 SEL_LESSON_START_BTN = 'button:has-text("レッスンスタート")'

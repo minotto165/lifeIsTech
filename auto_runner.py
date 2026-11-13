@@ -17,8 +17,11 @@ import sys
 import time
 
 import config
+import dom
+import poll
 import ui
-from chrome_session import ChromeSession, safe_page_url
+from chrome_session import ChromeSession
+from human_utils import human_click
 from instance_guard import acquire as acquire_instance
 from lifeistech_auto import log, run_lesson
 from member_api import (
@@ -33,17 +36,19 @@ from member_api import (
 )
 from work_automation import already_graded, run_work
 
-LESSON_BUTTONS = ", ".join(
-    [
-        config.SEL_LESSON_START_BTN,
-        config.SEL_LESSON_RESUME_BTN,
-        config.SEL_LESSON_RESTART_BTN,
-    ]
+# 開始系ボタンの優先順。一覧・セレクタ・選択処理はこの 1 か所から導出する。
+LESSON_BUTTON_TUPLE = (
+    config.SEL_LESSON_START_BTN,
+    config.SEL_LESSON_RESUME_BTN,
+    config.SEL_LESSON_RESTART_BTN,
 )
+LESSON_BUTTONS = ", ".join(LESSON_BUTTON_TUPLE)
 
-
-def safe_url(page):
-    return safe_page_url(page)
+# run_one の結果。完了・スキップ・失敗を区別しないと、未完了を完了として
+# 数えてしまうため、bool ではなくこの 3 値で返す。
+RESULT_DONE = "done"
+RESULT_SKIPPED = "skipped"
+RESULT_FAILED = "failed"
 
 
 def prune_screenshots(directory, keep):
@@ -54,8 +59,8 @@ def prune_screenshots(directory, keep):
         )
         for old in shots[max(keep, 0) :]:
             old.unlink()
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"古いスクリーンショットを消せませんでした: {e}")
 
 
 def screenshot(page, tag):
@@ -87,42 +92,23 @@ def goto_lesson_page(page, target):
 
 def choose_start_button(page):
     """表示されている開始系ボタンを優先順で選ぶ。"""
-    for selector in (
-        config.SEL_LESSON_START_BTN,
-        config.SEL_LESSON_RESUME_BTN,
-        config.SEL_LESSON_RESTART_BTN,
-    ):
+    for selector in LESSON_BUTTON_TUPLE:
         try:
             locator = page.locator(selector)
             if locator.count() > 0 and locator.first.is_visible():
                 return selector
-        except Exception:
+        except Exception as e:
+            log(f"開始ボタンの確認に失敗しました（{selector}）: {e}")
             continue
     return None
 
 
-def current_url(page):
-    """page.url が遷移に追随しないことがあるので、DOM からも現在 URL を取る。"""
-    url = safe_url(page)
-    try:
-        return page.evaluate("() => location.href") or url
-    except Exception:
-        return url
-
-
 def click_button(page, selector):
-    try:
-        from human_utils import human_click
-
-        human_click(
-            page.locator(selector).first,
-            base_delay=0,
-            timeout_ms=config.ACTION_CLICK_TIMEOUT_MS,
-        )
+    """dom.click に集約したクリック。押せなかったときだけログを出す。"""
+    if dom.click(page, selector, timeout_ms=config.ACTION_CLICK_TIMEOUT_MS):
         return True
-    except Exception as e:
-        log(f"ボタンを押せませんでした: {e}")
-        return False
+    log(f"ボタンを押せませんでした: {selector}")
+    return False
 
 
 def click_and_wait(context, page, selector, marker, timeout):
@@ -131,17 +117,17 @@ def click_and_wait(context, page, selector, marker, timeout):
     if not click_button(page, selector):
         return None
 
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
+    def find_target():
         for candidate in context.pages:
             if candidate in before:
                 continue
-            if marker in safe_url(candidate):
+            if marker in dom.safe_page_url(candidate):
                 return candidate
-        if marker in current_url(page):
+        if marker in dom.safe_page_url(page):
             return page
-        time.sleep(config.NAV_POLL_SEC)
-    return None
+        return None
+
+    return poll.poll_until(find_target, timeout, interval=config.NAV_POLL_SEC)
 
 
 def preferred_os():
@@ -181,8 +167,6 @@ def pick_player_link(detail, selector):
 
 def choose_os_if_asked(page):
     """OS 選択ダイアログが出ていれば、この環境に合う OS を選ぶ。"""
-    from human_utils import human_click
-
     label = config.OS_CHOICE_LABELS.get(preferred_os())
     if not label:
         return False
@@ -198,7 +182,10 @@ def choose_os_if_asked(page):
         )
         log(f"端末の環境「{label}」を選びました。")
         return True
-    except Exception:
+    except Exception as e:
+        # ボタンはアイコン付きで text-is では当たらないため、dom.click ではなく
+        # 役割と名前で引いたロケータを human_click に渡す。
+        log(f"端末の環境「{label}」を選べませんでした: {e}")
         return False
 
 
@@ -214,15 +201,16 @@ def wait_for_player(api, context, page, target, selector, before, timeout=None):
     誤認して別レッスンを操作してしまうため、新しいタブだけを見る。
     """
     timeout = config.LESSON_PAGE_READY_TIMEOUT if timeout is None else timeout
-    end = time.monotonic() + timeout
     attempted = None
-    while time.monotonic() < end:
+
+    def find_player():
+        nonlocal attempted
         for candidate in context.pages:
             if candidate in before:
                 continue
-            if config.LESSON_PAGE_MARKER in safe_url(candidate):
+            if config.LESSON_PAGE_MARKER in dom.safe_page_url(candidate):
                 return candidate
-        if config.LESSON_PAGE_MARKER in current_url(page):
+        if config.LESSON_PAGE_MARKER in dom.safe_page_url(page):
             return page
         # EX① などは開始ボタンの後に「端末の環境を選択」が出る。
         choose_os_if_asked(page)
@@ -234,47 +222,52 @@ def wait_for_player(api, context, page, target, selector, before, timeout=None):
             raise
         except MemberApiError:
             detail = None
-        if detail:
-            status = (detail.get("player_lesson") or {}).get("status")
-            if status in ("started", STATUS_CLEARED):
-                link = pick_player_link(detail, selector)
-                if link and link != attempted:
-                    attempted = link
-                    remaining = max(end - time.monotonic(), 5.0)
-                    try:
-                        page.goto(
-                            link,
-                            wait_until="domcontentloaded",
-                            timeout=int(remaining * 1000),
-                        )
-                        return page
-                    except Exception as e:
-                        # SPA 自身の遷移と競合すると
-                        # 「interrupted by another navigation」で goto が失敗する。
-                        # 遷移は進んでいるので URL を確かめて続行する。
-                        log(f"プレイヤーの遷移を待ちます: {e}")
-                        time.sleep(config.NAV_POLL_SEC)
-                        if config.LESSON_PAGE_MARKER in current_url(page):
-                            return page
-        time.sleep(config.NAV_POLL_SEC)
-    return None
+        if not detail:
+            return None
+        status = (detail.get("player_lesson") or {}).get("status")
+        if status not in ("started", STATUS_CLEARED):
+            return None
+        link = pick_player_link(detail, selector)
+        if not link or link == attempted:
+            return None
+        attempted = link
+        try:
+            page.goto(
+                link,
+                wait_until="domcontentloaded",
+                timeout=int(timeout * 1000),
+            )
+            return page
+        except Exception as e:
+            # SPA 自身の遷移と競合すると
+            # 「interrupted by another navigation」で goto が失敗する。
+            # 遷移は進んでいるので URL を確かめて続行する。
+            log(f"プレイヤーの遷移を待ちます: {e}")
+            if config.LESSON_PAGE_MARKER in dom.safe_page_url(page):
+                return page
+            return None
+
+    return poll.poll_until(find_player, timeout, interval=config.NAV_POLL_SEC)
 
 
 def wait_for_cleared(api, target, timeout):
     """API の status が cleared になるまで待つ。"""
-    end = time.monotonic() + timeout
     last_status = None
-    while time.monotonic() < end:
+
+    def is_cleared():
+        nonlocal last_status
         try:
             detail = api.lesson(target.chapter_id, target.lesson_id) or {}
             last_status = (detail.get("player_lesson") or {}).get("status")
-            if last_status == STATUS_CLEARED:
-                return True
+            return last_status == STATUS_CLEARED
         except AuthError:
             raise
         except MemberApiError as e:
             last_status = str(e)
-        time.sleep(config.API_POLL_SEC)
+            return False
+
+    if poll.poll_true(is_cleared, timeout, interval=config.API_POLL_SEC):
+        return True
     log(f"クリアを確認できませんでした（status={last_status}）。")
     return False
 
@@ -303,14 +296,13 @@ def checkwork_of(api, target):
     return None
 
 
-def wait_for_graded(page, timeout=10.0):
+def wait_for_graded(page, timeout=None):
     """採点結果の画面になるまで待つ。"""
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        if already_graded(page):
-            return True
-        time.sleep(config.FAST_POLL_SEC)
-    return False
+    if timeout is None:
+        timeout = config.CHECKWORK_GRADED_WAIT_SEC
+    return poll.poll_true(
+        lambda: already_graded(page), timeout, interval=config.FAST_POLL_SEC
+    )
 
 
 def run_checkwork(api, context, page, target):
@@ -347,10 +339,13 @@ def run_checkwork(api, context, page, target):
         screenshot(page, f"checkwork_{target.lesson_id}")
         return False
 
+    ok = False
     try:
         ok = run_work(work_page)
-        if ok:
-            wait_for_graded(work_page)
+        # 採点ボタンを押せても結果画面が出ないことがあるため、必ず確認する。
+        if ok and not wait_for_graded(work_page):
+            log("採点結果の画面を確認できませんでした。")
+            ok = False
     finally:
         if work_page is not page and not work_page.is_closed():
             work_page.close()
@@ -377,40 +372,41 @@ def run_one(api, context, page, target, index, total):
 
     if not goto_lesson_page(page, target):
         screenshot(page, target.lesson_id)
-        return False
+        return RESULT_FAILED
 
     try:
         page.wait_for_selector(
             LESSON_BUTTONS, timeout=int(config.LESSON_PAGE_READY_TIMEOUT * 1000)
         )
-    except Exception:
+    except Exception as e:
         if lesson_unavailable(page):
+            # 404 は「完了」ではなく「スキップ」。完了数に数えない。
             log("このレッスンは公開されていません（404）。スキップします。")
-            return True
-        log("レッスン開始ボタンが見つかりません。既に完了している可能性があります。")
+            return RESULT_SKIPPED
+        log(f"レッスン開始ボタンが見つかりません（{e}）。既に完了している可能性があります。")
         screenshot(page, f"no_button_{target.lesson_id}")
-        return False
+        return RESULT_FAILED
 
     selector = choose_start_button(page)
     if selector is None:
         log("押せる開始ボタンがありません。")
         screenshot(page, f"no_clickable_{target.lesson_id}")
-        return False
+        return RESULT_FAILED
     if selector == config.SEL_LESSON_RESTART_BTN and not config.AUTO_RESTART_PARTIAL:
         log("途中まで進んだレッスンですが、最初からやり直す設定になっていません。")
-        return False
+        return RESULT_FAILED
 
     before = set(context.pages)
     if not click_button(page, selector):
         screenshot(page, f"click_failed_{target.lesson_id}")
-        return False
+        return RESULT_FAILED
 
     player = wait_for_player(api, context, page, target, selector, before)
     if player is None:
         log("レッスンプレイヤーを開けませんでした。")
         screenshot(page, f"no_player_{target.lesson_id}")
-        return False
-    log(f"プレイヤーを開きました: {safe_url(player)}")
+        return RESULT_FAILED
+    log(f"プレイヤーを開きました: {dom.safe_page_url(player)}")
 
     try:
         if not run_lesson(player):
@@ -418,30 +414,33 @@ def run_one(api, context, page, target, index, total):
 
         if wait_for_cleared(api, target, config.AUTO_CLEAR_WAIT_SEC):
             log(f"レッスンをクリアしました（{time.monotonic() - started:.1f} 秒）。")
-            if config.AUTO_RUN_CHECKWORK:
-                run_checkwork(api, context, page, target)
-            return True
+            # 設定フラグと対応ワークの有無は run_checkwork 内で判定する。
+            run_checkwork(api, context, page, target)
+            return RESULT_DONE
 
         url = resume_url(api, target)
         if not url:
             log("未クリアですが再開リンクがありません。停止します。")
-            return False
+            return RESULT_FAILED
         log("未クリアのため、続きからもう一度だけ実行します。")
         try:
-            player.goto(url, wait_until="domcontentloaded", timeout=30000)
+            player.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=config.RESUME_PAGE_GOTO_TIMEOUT_MS,
+            )
         except Exception as e:
             log(f"再開リンクを開けませんでした: {e}")
-            return False
+            return RESULT_FAILED
         if not run_lesson(player):
             log("再開後の自動進行も正常終了しませんでした。")
 
         if wait_for_cleared(api, target, config.AUTO_CLEAR_WAIT_SEC):
             log(f"レッスンをクリアしました（{time.monotonic() - started:.1f} 秒）。")
-            if config.AUTO_RUN_CHECKWORK:
-                run_checkwork(api, context, page, target)
-            return True
+            run_checkwork(api, context, page, target)
+            return RESULT_DONE
         screenshot(player, f"not_cleared_{target.lesson_id}")
-        return False
+        return RESULT_FAILED
     finally:
         if player is not page and not player.is_closed():
             player.close()
@@ -615,7 +614,10 @@ def main(argv=None):
                 return exit_code
             # 明示的に選んだレッスンなので、完了済みでも「最初からやり直す」を許す。
             config.AUTO_RESTART_PARTIAL = True
-            exit_code = 0 if run_one(api, context, page, target, 1, 1) else 1
+            result = run_one(api, context, page, target, 1, 1)
+            if result == RESULT_SKIPPED:
+                log("選択したレッスンは公開されていないため、実行していません。")
+            exit_code = 0 if result != RESULT_FAILED else 1
             return exit_code
 
         targets = iter_lessons(
@@ -641,9 +643,18 @@ def main(argv=None):
             exit_code = 0
             return exit_code
 
+        done = 0
+        skipped = []
         failed = []
         for index, target in enumerate(targets, 1):
-            if run_one(api, context, page, target, index, len(targets)):
+            result = run_one(api, context, page, target, index, len(targets))
+            if result == RESULT_DONE:
+                done += 1
+                continue
+            if result == RESULT_SKIPPED:
+                # 完了ではないので done に数えず、スキップとして記録する。
+                skipped.append(target)
+                log(f"「{target.name}」は公開されていないため、スキップします。")
                 continue
             failed.append(target)
             if args.stop_on_failure:
@@ -653,9 +664,15 @@ def main(argv=None):
                 return exit_code
             log(f"「{target.name}」は自動化できませんでした（未完了のまま次へ進みます）。")
 
-        done = len(targets) - len(failed)
         log("")
-        log(f"{done} 件のレッスンを完了しました。")
+        log(
+            f"完了 {done} 件 / スキップ {len(skipped)} 件 / 失敗 {len(failed)} 件"
+            f"（対象 {len(targets)} 件）。"
+        )
+        if skipped:
+            log(f"公開されておらずスキップしたレッスン（{len(skipped)} 件）:")
+            for target in skipped:
+                log(f"  - {target.name} ({target.lesson_id})")
         if failed:
             log(f"自動化できなかったレッスン（{len(failed)} 件）:")
             for target in failed:
