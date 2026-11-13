@@ -4,6 +4,7 @@ import random
 import time
 
 import config
+import ui
 
 
 def human_sleep(base_seconds, fluctuation_ratio=0.5):
@@ -26,11 +27,14 @@ def human_click(element, base_delay=1.0, timeout_ms=config.ACTION_TIMEOUT_MS):
         human_sleep(max(base_delay, config.MIN_ACTION_DELAY))
     try:
         element.scroll_into_view_if_needed(timeout=timeout_ms)
-    except Exception:
-        pass
+    except Exception as exc:
+        # スクロールできなくてもクリック自体は試せるので続行する（原因は残す）。
+        ui.log(f"要素までスクロールできませんでした（{exc}）。表示位置のままクリックします。")
     try:
         box = element.bounding_box(timeout=timeout_ms)
-    except Exception:
+    except Exception as exc:
+        # 座標を使えないとクリックのタイムアウトまで失敗が遅れるので、1 行だけ残す。
+        ui.log(f"要素の位置を取得できませんでした（{exc}）。座標移動なしでクリックします。")
         box = None
     if not box:
         element.click(timeout=timeout_ms)
@@ -42,6 +46,7 @@ def human_click(element, base_delay=1.0, timeout_ms=config.ACTION_TIMEOUT_MS):
     # 検知できないため、当たり判定とリトライのある Playwright の経路を使う。
     try:
         element.page.mouse.move(x, y, steps=5)
-    except Exception:
-        pass
+    except Exception as exc:
+        # マウス移動は見た目だけの演出なので、失敗してもクリックは続ける。
+        ui.log(f"マウス移動に失敗しました（{exc}）。クリックのみ続行します。")
     element.click(timeout=timeout_ms)

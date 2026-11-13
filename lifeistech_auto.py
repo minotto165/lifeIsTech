@@ -13,27 +13,24 @@ import sys
 import time
 
 import config
+import dom
+import poll
 import ui
 from ai_analyzer import get_ai_response
+from dom import click_nth, click_visible, count, normalize
 from chrome_session import ChromeSession
 from human_utils import human_click, human_sleep
 from instance_guard import acquire as acquire_instance
 
 
+# ステップ処理の戻り値。None は「この種別の処理はしていない」。
+NEXT = "next"   # 処理したので次の周回へ
+ABORT = "abort"  # これ以上進めないので終了
+
+
 def log(message):
     # 色分けは ui 側で行う（rich が無い環境では素の print にフォールバック）。
     ui.log(message)
-
-
-def count(page, selector):
-    try:
-        return page.locator(selector).count()
-    except Exception as e:
-        # Chrome 側が落ちただけなのに「要素なし」と取り違えない。
-        text = str(e)
-        if "Target closed" in text or "has been closed" in text:
-            raise
-        return 0
 
 
 def current_step(page):
@@ -55,22 +52,12 @@ def current_step(page):
         return None
 
 
-def normalize(text):
-    return re.sub(r"\s+", "", text or "")
-
-
 def wait_for_step_change(page, before, timeout):
     """ステップが before から変わるまで最大 timeout 秒待つ。変われば True。
 
     固定 sleep ではなく、変わった瞬間に戻る条件待ち。timeout は上限としてだけ使う。
     """
-    deadline = time.monotonic() + timeout
-    while True:
-        if current_step(page) != before:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(config.FAST_POLL_SEC)
+    return poll.poll_true(lambda: current_step(page) != before, timeout)
 
 
 def step_key(step):
@@ -462,20 +449,12 @@ def click_step(page, targets, wait_sec=None):
     """
     if not targets:
         return False
-    deadline = time.monotonic() + (
+    limit = (
         (config.CLICK_WAIT_SEC if _needs_render_wait(targets) else config.CLICK_SHORT_WAIT_SEC)
         if wait_sec is None
         else wait_sec
     )
-    found = None
-    while True:
-        try:
-            found = page.evaluate(CLICK_FIND_JS, {"targets": targets})
-        except Exception:
-            found = None
-        if found or time.monotonic() >= deadline:
-            break
-        time.sleep(config.FAST_POLL_SEC)
+    found = _find_click_target(page, targets, limit)
     if not found:
         names = ", ".join(t.get("domId", "?") for t in targets)
         log(f"クリックできる要素が見つかりませんでした: {names}")
@@ -495,6 +474,18 @@ def click_step(page, targets, wait_sec=None):
     label = clean_label(target.get("text") or target.get("domId") or target["css"])
     log(f"「{label}」をクリックしました。")
     return True
+
+
+def _find_click_target(page, targets, timeout):
+    """クリックできる候補が描画されるまで待ち、見つかった 1 件を返す。"""
+
+    def probe():
+        try:
+            return page.evaluate(CLICK_FIND_JS, {"targets": targets})
+        except Exception:
+            return None
+
+    return poll.poll_until(probe, timeout)
 
 
 def _needs_render_wait(targets):
@@ -533,24 +524,25 @@ def parse_preview_rules(source):
 
 def preview_frame(page, timeout=None):
     """プレビュー（iframe）のフレームを返す。無ければ None。"""
-    end = time.monotonic() + (config.PREVIEW_READY_TIMEOUT if timeout is None else timeout)
-    while time.monotonic() < end:
+    limit = config.PREVIEW_READY_TIMEOUT if timeout is None else timeout
+    return poll.poll_until(lambda: _find_preview_frame(page), limit)
+
+
+def _find_preview_frame(page):
+    """プレビューのフレームを 1 回探す。無ければ None。"""
+    try:
         for frame in page.frames:
             if frame == page.main_frame:
                 continue
             if "html_playground" in (frame.url or ""):
                 return frame
-        try:
-            element = page.locator(config.SEL_PREVIEW_IFRAME).first
-            if element.count():
-                handle = element.element_handle()
-                if handle is not None:
-                    frame = handle.content_frame()
-                    if frame is not None:
-                        return frame
-        except Exception:
-            pass
-        time.sleep(config.FAST_POLL_SEC)
+        element = page.locator(config.SEL_PREVIEW_IFRAME).first
+        if element.count():
+            handle = element.element_handle()
+            if handle is not None:
+                return handle.content_frame()
+    except Exception:
+        return None
     return None
 
 
@@ -844,47 +836,6 @@ def find_choice_index(labels, correct):
     return None
 
 
-# locator を経由せず 1 往復でクリックする（毎回 3〜4 往復していたのを削減）。
-CLICK_NTH_JS = """([selector, index]) => {
-    const el = [...document.querySelectorAll(selector)][index];
-    if (!el) return false;
-    el.click();
-    return true;
-}"""
-
-
-CLICK_VISIBLE_JS = r"""([selector, text, disabledClass]) => {
-    const visible = (el) => {
-        const rect = el.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return false;
-        const style = getComputedStyle(el);
-        return style.visibility !== 'hidden' && style.display !== 'none';
-    };
-    const els = [...document.querySelectorAll(selector)].filter(visible);
-    const el = text ? els.find((e) => (e.textContent || '').includes(text)) : els[0];
-    if (!el) return null;
-    if (disabledClass && (el.className || '').includes(disabledClass)) return null;
-    const label = (el.textContent || '').trim().replace(/\s+/g, ' ');
-    el.click();
-    return label;
-}"""
-
-
-def click_visible(page, selector, text=None, disabled_class=None):
-    """見えているボタンを 1 往復でクリックし、押したボタンの文言を返す。"""
-    try:
-        return page.evaluate(CLICK_VISIBLE_JS, [selector, text, disabled_class])
-    except Exception:
-        return None
-
-
-def click_nth(page, selector, index):
-    if index is None or index < 0:
-        return False
-    try:
-        return bool(page.evaluate(CLICK_NTH_JS, [selector, index]))
-    except Exception:
-        return False
 
 
 def ask_ai(question, options):
@@ -902,17 +853,7 @@ def has_chosen(page):
 
 def wait_for_chosen(page, timeout=1.0):
     """クリックが実際に反映された（chosen が付いた）ことを確認する。"""
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        if has_chosen(page):
-            return True
-        time.sleep(config.FAST_POLL_SEC)
-    return False
-
-
-def quiz_open(page):
-    """通常クイズ・画像選択クイズのどちらかが開いているか。"""
-    return count(page, config.SEL_QUIZ_MODAL) + count(page, config.SEL_IMAGE_QUIZ_MODAL) > 0
+    return poll.poll_true(lambda: has_chosen(page), timeout)
 
 
 # body 全体の正規表現だと問題文に「正解」を含むだけで誤検知する。
@@ -949,12 +890,8 @@ def wait_for_feedback(page, timeout=None):
     この表示より先に Enter を送ると、次の問題のモーダルが
     「disabled のみ・chosen なし」のまま固まり、Enter では復帰しなくなる。
     """
-    end = time.monotonic() + (config.QUIZ_FEEDBACK_WAIT if timeout is None else timeout)
-    while time.monotonic() < end:
-        if has_feedback(page):
-            return True
-        time.sleep(config.FAST_POLL_SEC)
-    return False
+    limit = config.QUIZ_FEEDBACK_WAIT if timeout is None else timeout
+    return poll.poll_true(lambda: has_feedback(page), limit)
 
 
 # クイズが閉じたか（モーダルが消えたか）を 1 往復で見る。
@@ -963,6 +900,17 @@ QUIZ_CLOSE_JS = r"""() => {
     const text = document.querySelector('%(quiz_text)s');
     return {open: open, question: text ? (text.textContent || '').trim() : ''};
 }"""
+
+
+def _quiz_closed_or_changed(page, js, prev_question):
+    """クイズが閉じた、または別の問題に切り替わったか。"""
+    try:
+        state = page.evaluate(js) or {}
+    except Exception:
+        return False
+    if not state.get("open"):
+        return True
+    return normalize(state.get("question") or "") != normalize(prev_question or "")
 
 
 def close_quiz(page, prev_question, timeout=None):
@@ -983,19 +931,11 @@ def close_quiz(page, prev_question, timeout=None):
         press_enter(page)
         # 1 回の Enter が処理されるまで見て、閉じたら即戻る。
         # 閉じなければ次の Enter を送る（押し過ぎても回答済みなので安全）。
-        probe_until = min(deadline, time.monotonic() + config.QUIZ_ENTER_INTERVAL)
-        while True:
-            try:
-                state = page.evaluate(js) or {}
-            except Exception:
-                state = {}
-            if not state.get("open"):
-                return True
-            if normalize(state.get("question") or "") != normalize(prev_question or ""):
-                return True
-            if time.monotonic() >= probe_until:
-                break
-            time.sleep(config.FAST_POLL_SEC)
+        if poll.poll_true(
+            lambda: _quiz_closed_or_changed(page, js, prev_question),
+            config.QUIZ_ENTER_INTERVAL,
+        ):
+            return True
         if time.monotonic() >= deadline:
             return False
 
@@ -1008,59 +948,85 @@ def profile_log(message):
         log(f"[profile] {message}")
 
 
-def handle_quiz(page, answers, state=None):
-    """クイズが表示されていれば正解の選択肢をクリックして Enter で閉じる。
+def _resolve_quiz_index(kind, step, key, state, answers, image_answers, is_image):
+    """正解の選択肢 index を返す。決められないときは None（次の周回で再試行）。"""
+    if is_image:
+        info = image_answers["by_text"].get(key[1]) or image_answers["by_step"].get(step)
+        if not info:
+            log(f"画像選択クイズの正解を特定できませんでした（step {step}）。")
+            return None
+        try:
+            index = info["labels"].index(info["correct"])
+        except ValueError:
+            log(f"画像選択クイズの選択肢番号が不正です（step {step}）。")
+            return None
+        if (state.get("image_quiz_count") or 0) <= index:
+            log(f"画像選択クイズの選択肢が見つかりません（step {step}）。")
+            return None
+        return index
 
-    回答済みかどうかは「chosen クラスが付いているか」で判定する。
-    ステップ ID だけの記録だと、次の問題が同じ状態で開いたときに
-    「もう答えた」と誤判定して無視してしまうため。
-    """
+    labels = state.get("quiz_choices") or []
+    if not labels:
+        # まだ描画されていない。次の周回（数 ms 後）で読み直す。
+        return None
+    correct = answers["by_text"].get(key[1]) or answers["by_step"].get(step)
+    index = find_choice_index(labels, correct)
+    if index is None:
+        # シナリオから引けなかったときだけ AI に聞く。
+        index = find_choice_index(labels, ask_ai(state.get("quiz_question") or "", labels))
+    if index is None:
+        log(f"クイズの正解を特定できませんでした（step {step}）。次の周回で再試行します。")
+    return index
+
+
+def _answer_quiz(page, answers, image_answers, state=None, image=False):
+    """クイズに答えて閉じる（テキスト選択と画像選択で共通）。"""
     _started = time.perf_counter()
     state = state or read_state(page)
     step = int(state["step"]) if state.get("step") else current_step(page)
     question = state.get("quiz_question") or ""
     key = (step, normalize(question))
+    kind = "画像選択クイズ" if image else "クイズ"
+    selector = config.SEL_IMAGE_QUIZ_CHOICE if image else config.SEL_QUIZ_BUTTON
 
     if not state.get("quiz_chosen"):
         # まだ答えていない問題。選択肢を選ぶところからやり直す。
-        labels = state.get("quiz_choices") or []
-        if not labels:
-            # まだ描画されていない。次の周回（数 ms 後）で読み直す。
-            return
-
-        correct = answers["by_text"].get(key[1]) or answers["by_step"].get(step)
-        index = find_choice_index(labels, correct)
+        index = _resolve_quiz_index(
+            kind, step, key, state, answers, image_answers, image
+        )
         if index is None:
-            index = find_choice_index(labels, ask_ai(question, labels))
-        if index is None:
-            log(f"クイズの正解を特定できませんでした（step {step}）。次の周回で再試行します。")
             return
 
         # まず JS クリック（1 往復）。反映されなければ実クリックで押し直す。
-        click_nth(page, config.SEL_QUIZ_BUTTON, index)
+        click_nth(page, selector, index)
         if not wait_for_chosen(page, timeout=0.25):
             try:
                 human_click(
-                    page.locator(config.SEL_QUIZ_BUTTON).nth(index),
+                    page.locator(selector).nth(index),
                     base_delay=0,
                     timeout_ms=config.ACTION_CLICK_TIMEOUT_MS,
                 )
             except Exception as e:
-                log(f"選択肢のクリックに失敗しました: {e}")
+                log(f"{kind}のクリックに失敗しました: {e}")
                 return
             if not wait_for_chosen(page):
-                log(f"選択肢のクリックが反映されませんでした（step {step}）。再試行します。")
+                log(f"{kind}のクリックが反映されませんでした（step {step}）。再試行します。")
                 return
 
-        log(f"クイズに回答しました: {labels[index]}")
+        if image:
+            log(f"{kind}に回答しました（{index + 1} 番目）。")
+        else:
+            labels = state.get("quiz_choices") or [""]
+            log(f"{kind}に回答しました: {labels[index]}")
+
         _chosen = time.perf_counter()
         if not wait_for_feedback(page):
             log(f"正解表示を確認できませんでした（step {step}）。Enter を送ります。")
         _feedback = time.perf_counter()
         if not close_quiz(page, key[1]):
-            log(f"クイズが閉じませんでした（step {step}）。次の周回で再試行します。")
+            log(f"{kind}が閉じませんでした（step {step}）。次の周回で再試行します。")
         profile_log(
-            f"クイズ処理 {time.perf_counter() - _started:.2f} 秒（step {step}・選択"
+            f"{kind}処理 {time.perf_counter() - _started:.2f} 秒（step {step}・選択"
             f" {_chosen - _started:.2f} / 正解待ち {_feedback - _chosen:.2f} /"
             f" 閉じ {time.perf_counter() - _feedback:.2f}）"
         )
@@ -1069,67 +1035,17 @@ def handle_quiz(page, answers, state=None):
     # 回答済み（正解表示中）。正解表示が出ていることを確認してから Enter で閉じる。
     wait_for_feedback(page, timeout=1.0)
     if not close_quiz(page, key[1]):
-        log(f"クイズが閉じませんでした（step {step}）。次の周回で再試行します。")
+        log(f"{kind}が閉じませんでした（step {step}）。次の周回で再試行します。")
+
+
+def handle_quiz(page, answers, state=None):
+    """テキスト選択のクイズに答える。"""
+    _answer_quiz(page, answers, {}, state, image=False)
 
 
 def handle_image_quiz(page, image_answers, state=None):
-    """画像から選ぶクイズに答える。
-
-    選択肢は画像だけでテキストを持たないため、シナリオの quizChoices の並びと
-    correctChoice（choiceLabel）からクリックする位置を決める。
-    """
-    _started = time.perf_counter()
-    state = state or read_state(page)
-    step = int(state["step"]) if state.get("step") else current_step(page)
-    question = state.get("quiz_question") or ""
-    key = (step, normalize(question))
-
-    if not state.get("quiz_chosen"):
-        info = image_answers["by_text"].get(key[1]) or image_answers["by_step"].get(step)
-        if not info:
-            log(f"画像選択クイズの正解を特定できませんでした（step {step}）。")
-            return
-        try:
-            index = info["labels"].index(info["correct"])
-        except ValueError:
-            log(f"画像選択クイズの選択肢番号が不正です（step {step}）。")
-            return
-
-        if (state.get("image_quiz_count") or 0) <= index:
-            log(f"画像選択クイズの選択肢が見つかりません（step {step}）。")
-            return
-        click_nth(page, config.SEL_IMAGE_QUIZ_CHOICE, index)
-        if not wait_for_chosen(page, timeout=0.25):
-            try:
-                human_click(
-                    page.locator(config.SEL_IMAGE_QUIZ_CHOICE).nth(index),
-                    base_delay=0,
-                    timeout_ms=config.ACTION_CLICK_TIMEOUT_MS,
-                )
-            except Exception as e:
-                log(f"画像選択クイズのクリックに失敗しました: {e}")
-                return
-            if not wait_for_chosen(page):
-                log(f"画像選択クイズのクリックが反映されませんでした（step {step}）。")
-                return
-
-        log(f"画像選択クイズに回答しました（{index + 1} 番目）。")
-        _chosen = time.perf_counter()
-        if not wait_for_feedback(page):
-            log(f"正解表示を確認できませんでした（step {step}）。Enter を送ります。")
-        _feedback = time.perf_counter()
-        if not close_quiz(page, key[1]):
-            log(f"画像選択クイズが閉じませんでした（step {step}）。次の周回で再試行します。")
-        profile_log(
-            f"画像クイズ処理 {time.perf_counter() - _started:.2f} 秒（step {step}・選択"
-            f" {_chosen - _started:.2f} / 正解待ち {_feedback - _chosen:.2f} /"
-            f" 閉じ {time.perf_counter() - _feedback:.2f}）"
-        )
-        return
-
-    wait_for_feedback(page, timeout=1.0)
-    if not close_quiz(page, key[1]):
-        log(f"画像選択クイズが閉じませんでした（step {step}）。次の周回で再試行します。")
+    """画像から選ぶクイズに答える。"""
+    _answer_quiz(page, {}, image_answers, state, image=True)
 
 
 # --- コード課題 ------------------------------------------------------
@@ -1482,19 +1398,12 @@ def click_run_button(page, timeout=1.5):
     結果ウィンドウを閉じた直後は、まだボタンが隠れていることがあるので
     表示されるまで少し待つ。
     """
-    deadline = time.monotonic() + timeout
-    while True:
-        button = page.locator(config.SEL_CODE_RUN_BTN).first
-        try:
-            if button.count() > 0 and button.is_visible():
-                button.evaluate("(el) => el.click()")
-                log("「実行」ボタンを押しました。")
-                return True
-        except Exception:
-            pass
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(config.FAST_POLL_SEC)
+    if not poll.poll_true(
+        lambda: dom.click(page, config.SEL_CODE_RUN_BTN, human=False), timeout
+    ):
+        return False
+    log("「実行」ボタンを押しました。")
+    return True
 
 
 # ステップ番号と「結果ウィンドウが開いているか」を 1 往復で取る。
@@ -1516,29 +1425,14 @@ CODE_WAIT_JS = r"""() => {
 
 def click_code_check(page):
     """「コードチェック」を押す。押せなくても例外は出さない。"""
-    button = page.locator(config.SEL_CODE_CHECK_BTN).first
-    try:
-        if button.count() == 0:
-            return False
-        button.evaluate("(el) => el.click()")
-        return True
-    except Exception:
-        return False
+    return dom.click(page, config.SEL_CODE_CHECK_BTN, human=False)
 
 
 def close_code_result(page, timeout=3.0):
     """コードチェック後に出る結果ウィンドウを閉じる。"""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        link = page.locator(config.SEL_CODE_RESULT_CLOSE).first
-        try:
-            if link.count() > 0 and link.is_visible():
-                link.evaluate("(el) => el.click()")
-                return True
-        except Exception:
-            pass
-        time.sleep(config.FAST_POLL_SEC)
-    return False
+    return poll.poll_true(
+        lambda: dom.click(page, config.SEL_CODE_RESULT_CLOSE, human=False), timeout
+    )
 
 
 # --- 画面遷移 --------------------------------------------------------
@@ -1563,18 +1457,10 @@ def press_confirm_if_visible(page):
     シナリオの exitCondition に Click が書かれていないステップでも
     OK 待ちになることがあるため、詰まったときの保険として使う。
     """
-    try:
-        button = page.locator(config.SEL_CONFIRM_BTN).first
-        if not button.count() or not button.is_visible():
-            return False
-        try:
-            button.evaluate("(el) => el.click()")
-        except Exception:
-            return False
-        log("「OK」ボタンを押しました。")
-        return True
-    except Exception:
+    if not dom.click(page, config.SEL_CONFIRM_BTN, human=False):
         return False
+    log("「OK」ボタンを押しました。")
+    return True
 
 
 def click_action_button(page):
@@ -1588,32 +1474,11 @@ def click_action_button(page):
     if label:
         log(f"「{clean_label(label)}」ボタンを押しました。")
         return True
-    step = current_step(page)
-    buttons = page.locator(config.SEL_LESSON_ACTION_BTN)
-    for index in range(buttons.count()):
-        button = buttons.nth(index)
-        try:
-            if not button.is_visible():
-                continue
-            text = clean_label(re.sub(r"\s+", " ", button.inner_text()).strip())
-        except Exception:
-            continue
-        try:
-            human_click(button, base_delay=0, timeout_ms=config.ACTION_CLICK_TIMEOUT_MS)
-        except Exception:
-            # 押す前にステップが進んでいただけなら、何もしなくてよい。
-            if current_step(page) != step:
-                return False
-            # 覆われているなどでクリックできない場合は JS で直接押す。
-            try:
-                if not button.is_visible():
-                    return False
-                button.evaluate("(el) => el.click()")
-            except Exception:
-                return False
-        log(f"「{text}」ボタンを押しました。")
-        return True
-    return False
+    # 見えている要素が JS 側で取れない場合だけ実クリックを試す。
+    if not dom.click(page, config.SEL_LESSON_ACTION_BTN, human=True):
+        return False
+    log("進行ボタンを押しました。")
+    return True
 
 
 # --- メイン ----------------------------------------------------------
@@ -1752,321 +1617,455 @@ def log_finish_speed(started_at, passed_steps):
         )
 
 
-def _run_lesson_loop(page):
-    page.set_default_timeout(config.ACTION_TIMEOUT_MS)
-    state = read_state(page)
-    if not state["in_lesson"]:
-        log("レッスンページが開かれていません。ブラウザでレッスンを開いてから実行してください。")
-        return False
+class StepMetrics:
+    """速度計測（LIFEISTECH_PROFILE / CALIB / STEP_LOG）を制御から切り離す。
 
-    if config.DISABLE_CSS_ANIMATION:
-        install_animation_killer(page)
-    if config.SHORTEN_LONG_TIMERS:
-        install_timer_clamp(page)
+    制御ループは「何をするか」だけを持ち、時間の記録はここに集める。
+    計測が無効なとき（既定）は記録の呼び出しだけが残り、判定には影響しない。
+    """
 
-    data = load_scenario_data(page)
-    answers = data["answers"]
-    image_answers = data["image_answers"]
-    code_tasks = data["codes"]
-    preview_tasks = data["previews"]
-    click_tasks = data["clicks"]
-    free_inputs = data["free_inputs"]
-    structure = data["structure"]
-    # step -> 最後に進行ボタンを押した時刻（同じステップで押し直せるようにする）。
-    clicked_action_steps = {}
-    confirm_pressed = set()
-    clicked_steps = set()
-    click_attempts = {}
-    code_attempts = {}
-    preview_attempts = {}
-    preview_unsupported = set()
-    quiz_reloads = {}
-    last_step = state["step"]
-    last_change = time.monotonic()
-    locked_since = None
-    quiz_key = None
-    quiz_since = None
-    log(f"ステップ {last_step} から開始します。")
-    started_at = time.monotonic()
-    passed_steps = 0
-    # LIFEISTECH_PROFILE=1 で 100 周ごとに内訳を出す（速度チューニング用）。
-    profile = bool(os.environ.get("LIFEISTECH_PROFILE"))
-    prof = {"read": 0.0, "skip": 0.0, "enter": 0.0, "action": 0.0, "count": 0}
-    skip_state = {"t": 0.0}
-    # LIFEISTECH_CALIB=1 で Enter 間隔を切り替えながら ms/ステップを測る（調整用）。
-    calib_delays = [0.0, 0.005, 0.01, 0.02, 0.04] if os.environ.get("LIFEISTECH_CALIB") == "1" else None
-    calib_index = 0
-    calib_block_started = time.monotonic()
-    calib_block_steps = 0
+    def __init__(self):
+        self.enabled = PROFILE
+        self.totals = {"read": 0.0, "skip": 0.0, "enter": 0.0, "action": 0.0}
+        self.loops = 0
+        self.log_path = os.environ.get("LIFEISTECH_STEP_LOG")
+        if self.log_path == "1":
+            self.log_path = "/tmp/lifeistech_steps.jsonl"
+        self.calib_delays = (
+            [0.0, 0.005, 0.01, 0.02, 0.04]
+            if os.environ.get("LIFEISTECH_CALIB") == "1"
+            else None
+        )
+        self.calib_index = 0
+        self.calib_started = time.monotonic()
+        self.calib_steps = 0
+        self.step_started = time.monotonic()
+        self.step_loops = 0
+        self.step_number = None
+        self.marks = {}
+        self.handled_kinds = set()
 
-    def reload_and_reset(reason):
-        """再読込して、ステップ依存の記録とシナリオの対応表を作り直す。"""
-        nonlocal data, answers, image_answers, code_tasks, preview_tasks, click_tasks
-        nonlocal free_inputs, structure
-        nonlocal last_change, locked_since, quiz_key, quiz_since, last_step
-        if not reload_page(page, reason):
-            return False
-        clicked_action_steps.clear()
-        confirm_pressed.clear()
-        clicked_steps.clear()
-        click_attempts.clear()
-        code_attempts.clear()
-        preview_attempts.clear()
-        locked_since = None
-        quiz_key = None
-        quiz_since = None
-        # 再読込直後はプレイヤーの描画を待つ。固定 sleep ではなく、
-        # レッスンページとして読めるようになった瞬間に先へ進む。
-        ready_deadline = time.monotonic() + config.LESSON_PAGE_READY_TIMEOUT
-        while time.monotonic() < ready_deadline:
-            try:
-                if read_state(page)["in_lesson"]:
-                    break
-            except Exception:
-                pass
-            time.sleep(config.NAV_POLL_SEC)
+    def begin(self, step):
+        self.step_number = step
+        self.step_started = time.monotonic()
+        self.marks = {}
+        self.handled_kinds = set()
+
+    def count(self, kind, elapsed):
+        self.totals[kind] += elapsed
+        if kind == "read":
+            self.loops += 1
+            self.step_loops += 1
+
+    def log_profile(self, started_at):
+        if not self.enabled or self.loops == 0 or self.loops % 100:
+            return
+        wall = time.monotonic() - started_at
+        loops = self.loops
+        log(
+            f"[profile] {loops} 周 / {wall:.1f} 秒"
+            f"（1 周 {wall / loops * 1000:.0f} ms・"
+            f"read {self.totals['read'] / loops * 1000:.1f} /"
+            f" skip {self.totals['skip'] / loops * 1000:.1f} /"
+            f" enter {self.totals['enter'] / loops * 1000:.1f} /"
+            f" action {self.totals['action'] / loops * 1000:.1f} ms）"
+        )
+
+    def observe(self, state, now):
+        """そのステップで吹き出し・ボタン・クイズ・エディタが現れた時刻を残す。"""
+        if not self.log_path:
+            return
+        marks = {
+            "talk": state["talk"],
+            "button": state["action"],
+            "quiz": state["quiz"] or state["image_quiz"],
+            "editor": state["editor"],
+        }
+        for key, present in marks.items():
+            if present:
+                self.marks.setdefault(key, round(now - self.step_started, 3))
+
+    def handled(self, kind):
+        self.handled_kinds.add(kind)
+
+    def next_step(self, step, now, structure, passed_steps):
+        """ステップが変わったときの記録。更新後の通過数を返す。"""
+        profile_log(
+            f"step {self.step_number} → {step}: {now - self.step_started:.3f} 秒"
+            f" / {self.step_loops} 周"
+        )
+        if self.log_path:
+            write_step_log(
+                self.log_path,
+                self.step_number,
+                now - self.step_started,
+                self.step_loops,
+                self.marks,
+                structure.get(self.step_number),
+                self.handled_kinds,
+            )
+            self.step_number = step
+            self.marks = {}
+            self.handled_kinds = set()
+        self.step_started = now
+        self.step_loops = 0
+        return self._calibrate(now, passed_steps + 1)
+
+    def _calibrate(self, now, passed_steps):
+        if not self.calib_delays or passed_steps - self.calib_steps < 60:
+            return passed_steps
+        elapsed = now - self.calib_started
+        count = passed_steps - self.calib_steps
+        log(
+            f"[calib] Enter 間隔 {self.calib_delays[self.calib_index] * 1000:.0f} ms →"
+            f" {count} ステップ / {elapsed:.1f} 秒"
+            f" = {elapsed / count * 1000:.0f} ms/ステップ"
+        )
+        self.calib_index = (self.calib_index + 1) % len(self.calib_delays)
+        self.calib_started = now
+        self.calib_steps = passed_steps
+        return passed_steps
+
+    def delay(self):
+        if self.calib_delays:
+            return self.calib_delays[self.calib_index]
+        return config.ENTER_SPAM_DELAY
+
+
+class LessonRunner:
+    """1 レッスン分の制御ループ。
+
+    ステップ種別ごとの処理をメソッドに分け、共有する状態はインスタンスに持つ。
+    各メソッドは「処理していない」= None、「処理したので次の周回へ」= NEXT、
+    「これ以上進めない」= ABORT を返す。
+    """
+
+    def __init__(self, page):
+        self.page = page
+        self.metrics = StepMetrics()
+        self.answers = {}
+        self.image_answers = {}
+        self.code_tasks = {}
+        self.preview_tasks = set()
+        self.click_tasks = {}
+        self.free_inputs = set()
+        self.structure = {}
+        self.last_step = None
+        self.last_change = 0.0
+        self.started_at = 0.0
+        self.passed_steps = 0
+        self.skip_at = 0.0
+        # ステップごとの試行回数・記録。
+        self.clicked_action_steps = {}
+        self.confirm_pressed = set()
+        self.clicked_steps = set()
+        self.click_attempts = {}
+        self.code_attempts = {}
+        self.preview_attempts = {}
+        self.preview_unsupported = set()
+        self.quiz_reloads = {}
+        self.locked_since = None
+        self.quiz_key = None
+        self.quiz_since = None
+
+    # --- 準備 ---------------------------------------------------------
+
+    def _install_injections(self):
         if config.DISABLE_CSS_ANIMATION:
-            install_animation_killer(page)
+            install_animation_killer(self.page)
         if config.SHORTEN_LONG_TIMERS:
-            install_timer_clamp(page)
-        # 再読込で別シナリオに移っていることがあるので取り直す。
-        data = load_scenario_data(page)
-        answers = data["answers"]
-        image_answers = data["image_answers"]
-        code_tasks = data["codes"]
-        preview_tasks = data["previews"]
-        click_tasks = data["clicks"]
-        free_inputs = data["free_inputs"]
-        structure = data["structure"]
+            install_timer_clamp(self.page)
+
+    def _load_data(self):
+        data = load_scenario_data(self.page)
+        self.answers = data["answers"]
+        self.image_answers = data["image_answers"]
+        self.code_tasks = data["codes"]
+        self.preview_tasks = data["previews"]
+        self.click_tasks = data["clicks"]
+        self.free_inputs = data["free_inputs"]
+        self.structure = data["structure"]
+
+    def _reset_records(self):
+        self.clicked_action_steps.clear()
+        self.confirm_pressed.clear()
+        self.clicked_steps.clear()
+        self.click_attempts.clear()
+        self.code_attempts.clear()
+        self.preview_attempts.clear()
+        self._clear_quiz_tracking()
+
+    def _in_lesson(self):
         try:
-            last_step = read_state(page)["step"]
+            return read_state(self.page)["in_lesson"]
         except Exception:
-            last_step = None
-        last_change = time.monotonic()
+            return False
+
+    def _reload(self, reason):
+        """再読込して、ステップ依存の記録とシナリオの対応表を作り直す。"""
+        if not reload_page(self.page, reason):
+            return False
+        self._reset_records()
+        # 再読込直後はプレイヤーの描画を待つ（レッスンとして読めるまで）。
+        poll.poll_true(self._in_lesson, config.LESSON_PAGE_READY_TIMEOUT, config.NAV_POLL_SEC)
+        self._install_injections()
+        # 再読込で別シナリオに移っていることがあるので取り直す。
+        self._load_data()
+        try:
+            self.last_step = read_state(self.page)["step"]
+        except Exception:
+            self.last_step = None
+        self.last_change = time.monotonic()
         return True
 
-    # LIFEISTECH_STEP_LOG=1 で 1 ステップごとの所要時間と構造を JSON Lines に残す。
-    step_log_path = os.environ.get("LIFEISTECH_STEP_LOG")
-    if step_log_path == "1":
-        step_log_path = "/tmp/lifeistech_steps.jsonl"
+    # --- ステップ種別ごとの処理 ---------------------------------------
 
-    step_started = time.monotonic()
-    step_loops = 0
-    step_number = last_step
-    step_marks = {}
-    step_handled = set()
-    while True:
-        _t0 = time.perf_counter()
-        step_loops += 1
-        try:
-            state = read_state(page)
-        except Exception as e:
-            # レッスン完了時は SPA 遷移で実行コンテキストが破棄される。
-            if "Execution context was destroyed" in str(e):
-                # SPA 遷移中。完了画面に変わるまで条件待ちする。
-                finish_deadline = time.monotonic() + config.LESSON_PAGE_READY_TIMEOUT
-                while not lesson_finished(page) and time.monotonic() < finish_deadline:
-                    time.sleep(config.NAV_POLL_SEC)
-                if lesson_finished(page):
-                    log_finish_speed(started_at, passed_steps)
-                    return True
-                log("ページが遷移しましたが、終了画面を確認できませんでした。")
-                return False
-            raise
-        prof["read"] += time.perf_counter() - _t0
-        prof["count"] += 1
-        if profile and prof["count"] % 100 == 0:
-            _wall = time.monotonic() - started_at
-            log(
-                f"[profile] {prof['count']} 周 / {_wall:.1f} 秒"
-                f"（1 周 {_wall / prof['count'] * 1000:.0f} ms・"
-                f"read {prof['read'] / prof['count'] * 1000:.1f} /"
-                f" skip {prof['skip'] / prof['count'] * 1000:.1f} /"
-                f" enter {prof['enter'] / prof['count'] * 1000:.1f} /"
-                f" action {prof['action'] / prof['count'] * 1000:.1f} ms）"
-            )
-        if not state["in_lesson"]:
-            if lesson_finished(page):
-                log_finish_speed(started_at, passed_steps)
-                return True
-            log("レッスンページを離れたため終了します（完了画面は未確認）。")
-            return False
+    def _clear_quiz_tracking(self):
+        self.locked_since = None
+        self.quiz_key = None
+        self.quiz_since = None
 
-        # ステップ番号はシナリオ JSON（int）と突き合わせるので int にそろえる。
-        step = int(state["step"]) if state["step"] else None
-        now = time.monotonic()
-        if step != last_step:
-            log(f"ステップ {step} を通過しました。")
-            profile_log(
-                f"step {last_step} → {step}: {now - step_started:.3f} 秒 / {step_loops} 周"
-            )
-            if step_log_path:
-                write_step_log(
-                    step_log_path,
-                    step_number,
-                    now - step_started,
-                    step_loops,
-                    step_marks,
-                    structure.get(step_number),
-                    step_handled,
-                )
-                step_number = step
-                step_marks = {}
-                step_handled = set()
-            step_started = now
-            step_loops = 0
-            passed_steps += 1
-            if calib_delays and passed_steps - calib_block_steps >= 60:
-                _dt = now - calib_block_started
-                _n = passed_steps - calib_block_steps
-                log(
-                    f"[calib] Enter 間隔 {calib_delays[calib_index] * 1000:.0f} ms →"
-                    f" {_n} ステップ / {_dt:.1f} 秒 = {_dt / _n * 1000:.0f} ms/ステップ"
-                )
-                calib_index = (calib_index + 1) % len(calib_delays)
-                calib_block_started = now
-                calib_block_steps = passed_steps
-            last_step = step
-            last_change = now
+    def _quiz_step(self, state, step, now):
+        if not (state["quiz"] or state["image_quiz"]):
+            return None
+        # 「disabled のみ・chosen なし」で固まったモーダルは Enter では
+        # 復帰できないため、一定時間で再読込して立て直す。
+        if state["quiz_locked"]:
+            self.locked_since = self.locked_since or now
+            if now - self.locked_since > config.BROKEN_QUIZ_WAIT:
+                self.locked_since = None
+                if self._reload("壊れたクイズ"):
+                    return NEXT
+        else:
+            self.locked_since = None
 
-        # 観測用: そのステップで吹き出し・ボタン・クイズ・エディタが現れた時刻。
-        if step_log_path:
-            if state["talk"]:
-                step_marks.setdefault("talk", round(now - step_started, 3))
-            if state["action"]:
-                step_marks.setdefault("button", round(now - step_started, 3))
-            if state["quiz"] or state["image_quiz"]:
-                step_marks.setdefault("quiz", round(now - step_started, 3))
-            if state["editor"]:
-                step_marks.setdefault("editor", round(now - step_started, 3))
+        # 同じ問題のまま進まないクイズは、Enter 連打では解決しない。
+        # 一定時間で諦めて再読込し、それでも駄目なら停止する。
+        key = (step, normalize(state.get("quiz_question") or ""))
+        if key != self.quiz_key:
+            self.quiz_key = key
+            self.quiz_since = now
+        elif self.quiz_since is not None and now - self.quiz_since > config.QUIZ_GIVEUP_AFTER:
+            tries = self.quiz_reloads.get(step, 0) + 1
+            self.quiz_reloads[step] = tries
+            if tries > config.QUIZ_MAX_RELOADS:
+                log(f"クイズを解けないため停止します（step {step}）。手動で確認してください。")
+                return ABORT
+            log(f"クイズが反応しないため再読込します（step {step}・{tries} 回目）。")
+            if not self._reload("クイズが応答しない"):
+                return ABORT
+            return NEXT
 
-        if state["quiz"] or state["image_quiz"]:
-            # 「disabled のみ・chosen なし」で固まったモーダルは Enter では
-            # 復帰できないため、一定時間で再読込して立て直す。
-            if state["quiz_locked"]:
-                locked_since = locked_since or now
-                if now - locked_since > config.BROKEN_QUIZ_WAIT:
-                    locked_since = None
-                    if reload_and_reset("壊れたクイズ"):
-                        continue
-            else:
-                locked_since = None
-            # 同じ問題のまま進まないクイズは、Enter 連打では解決しない。
-            # 一定時間で諦めて再読込し、それでも駄目なら停止する。
-            key = (step, normalize(state.get("quiz_question") or ""))
-            if key != quiz_key:
-                quiz_key = key
-                quiz_since = now
-            elif quiz_since is not None and now - quiz_since > config.QUIZ_GIVEUP_AFTER:
-                tries = quiz_reloads.get(step, 0) + 1
-                quiz_reloads[step] = tries
-                if tries > config.QUIZ_MAX_RELOADS:
-                    log(f"クイズを解けないため停止します（step {step}）。手動で確認してください。")
-                    return False
-                log(f"クイズが反応しないため再読込します（step {step}・{tries} 回目）。")
-                if not reload_and_reset("クイズが応答しない"):
-                    return False
-                continue
+        self.metrics.handled("quiz")
+        if state["image_quiz"]:
+            handle_image_quiz(self.page, self.image_answers, state)
+        else:
+            handle_quiz(self.page, self.answers, state)
+        return NEXT
 
-            step_handled.add("quiz")
-            if state["image_quiz"]:
-                handle_image_quiz(page, image_answers, state)
-            else:
-                handle_quiz(page, answers, state)
-            continue
-        locked_since = None
-        quiz_key = None
-        quiz_since = None
-
+    def _free_input_step(self, step):
         # ヒントを読んで自分で書く課題は、正解がシナリオに無いので自動解答できない。
         # ここで早めに止めないと 30 秒×2 待ってから諦めることになる。
-        if step and step in free_inputs:
+        if step and step in self.free_inputs:
             log(f"自由入力のコード課題のため自動解答できません（step {step}）。")
-            return False
+            return ABORT
+        return None
 
+    def _code_step(self, step):
         # コード課題: エディタに解答を入れて「コードチェック」を押す。
-        if step and step in code_tasks and has_code_check(page):
-            tries = code_attempts.get(step, 0)
-            if tries < config.CODE_MAX_ATTEMPTS:
-                code_attempts[step] = tries + 1
-                log(f"コード課題に解答します（step {step}・{tries + 1} 回目）。")
-                step_handled.add("code")
-                started_task = time.perf_counter()
-                if apply_code_task(page, code_tasks[step]):
-                    last_change = time.monotonic()
-                profile_log(f"コード課題 {time.perf_counter() - started_task:.2f} 秒（step {step}）")
-                # 固定待機はしない。次の周回で状態を読み直す。
-                continue
+        if not (step and step in self.code_tasks and has_code_check(self.page)):
+            return None
+        tries = self.code_attempts.get(step, 0)
+        if tries >= config.CODE_MAX_ATTEMPTS:
             if tries == config.CODE_MAX_ATTEMPTS:
-                code_attempts[step] = tries + 1
+                self.code_attempts[step] = tries + 1
                 log(f"コード課題が通りません（step {step}）。手動確認してください。")
+            return None
+        self.code_attempts[step] = tries + 1
+        log(f"コード課題に解答します（step {step}・{tries + 1} 回目）。")
+        self.metrics.handled("code")
+        started = time.perf_counter()
+        if apply_code_task(self.page, self.code_tasks[step]):
+            self.last_change = time.monotonic()
+        profile_log(f"コード課題 {time.perf_counter() - started:.2f} 秒（step {step}）")
+        return NEXT
 
+    def _click_step(self, step):
         # 「この要素をクリック」で進むステップ（右上の OK ボタンなど）。
-        if step and step in click_tasks and step not in clicked_steps:
-            tries = click_attempts.get(step, 0)
-            if tries < config.CLICK_MAX_ATTEMPTS:
-                click_attempts[step] = tries + 1
-                log(f"クリック課題に解答します（step {step}・{tries + 1} 回目）。")
-                step_handled.add("click")
-                # 1 回目で見つからなければ、2 回目以降は短く待つだけにする。
-                wait = config.CLICK_WAIT_SEC if tries == 0 else config.CLICK_RETRY_WAIT_SEC
-                if click_step(page, click_tasks[step], wait_sec=wait):
-                    clicked_steps.add(step)
-                    last_change = time.monotonic()
-                    continue
+        if not (step and step in self.click_tasks and step not in self.clicked_steps):
+            return None
+        tries = self.click_attempts.get(step, 0)
+        if tries >= config.CLICK_MAX_ATTEMPTS:
+            return None
+        self.click_attempts[step] = tries + 1
+        log(f"クリック課題に解答します（step {step}・{tries + 1} 回目）。")
+        self.metrics.handled("click")
+        # 1 回目で見つからなければ、2 回目以降は短く待つだけにする。
+        wait = config.CLICK_WAIT_SEC if tries == 0 else config.CLICK_RETRY_WAIT_SEC
+        if click_step(self.page, self.click_tasks[step], wait_sec=wait):
+            self.clicked_steps.add(step)
+            self.last_change = time.monotonic()
+            return NEXT
+        return None
 
+    def _preview_step(self, step):
         # プレビュー型の課題（表計算など）: 成功条件のセルへ入力する。
-        if step and step in preview_tasks and step not in preview_unsupported:
-            tries = preview_attempts.get(step, 0)
-            if tries >= config.PREVIEW_MAX_ATTEMPTS:
-                log(f"プレビューの課題が通りません（step {step}）。手動確認してください。")
-                return False
-            preview_attempts[step] = tries + 1
-            log(f"プレビューの課題に解答します（step {step}・{tries + 1} 回目）。")
-            step_handled.add("preview")
-            applied, supported = apply_preview_task(page)
-            if applied:
-                last_change = time.monotonic()
-                continue
-            if not supported:
-                preview_unsupported.add(step)
-                log(f"未対応のプレビュー課題です（step {step}）。通常の進行処理に任せます。")
+        if not (
+            step
+            and step in self.preview_tasks
+            and step not in self.preview_unsupported
+        ):
+            return None
+        tries = self.preview_attempts.get(step, 0)
+        if tries >= config.PREVIEW_MAX_ATTEMPTS:
+            log(f"プレビューの課題が通りません（step {step}）。手動確認してください。")
+            return ABORT
+        self.preview_attempts[step] = tries + 1
+        log(f"プレビューの課題に解答します（step {step}・{tries + 1} 回目）。")
+        self.metrics.handled("preview")
+        applied, supported = apply_preview_task(self.page)
+        if applied:
+            self.last_change = time.monotonic()
+            return NEXT
+        if not supported:
+            self.preview_unsupported.add(step)
+            log(f"未対応のプレビュー課題です（step {step}）。通常の進行処理に任せます。")
+        return None
 
-        # 進行ボタン（Quiz / Next）は、押しても反応しないことがある。
-        # ステップが変わるまで短い間隔で押し直して、反応待ちの空白を無くす。
-        if state["action"]:
-            if now - clicked_action_steps.get(step, 0.0) >= config.ACTION_RECLICK_DELAY:
-                clicked_action_steps[step] = now
-                _t = time.perf_counter()
-                if click_action_button(page):
-                    last_change = time.monotonic()
-                prof["action"] += time.perf_counter() - _t
+    def _progress(self, state, step, now):
+        """進行ボタン → アニメ飛ばし → Enter → 詰まり判定を 1 周分まとめて行う。"""
+        page = self.page
+        if state["action"] and (
+            now - self.clicked_action_steps.get(step, 0.0)
+            >= config.ACTION_RECLICK_DELAY
+        ):
+            self.clicked_action_steps[step] = now
+            started = time.perf_counter()
+            if click_action_button(page):
+                self.last_change = time.monotonic()
+            self.metrics.count("action", time.perf_counter() - started)
 
         # アニメーション完了待ち（約900ms）を飛ばす。
         # 毎周回だと React の再描画が無駄に走るので短い間隔で間引く。
-        if now - skip_state["t"] >= config.SKIP_ANIMATION_INTERVAL:
-            skip_state["t"] = now
-            _t = time.perf_counter()
+        if now - self.skip_at >= config.SKIP_ANIMATION_INTERVAL:
+            self.skip_at = now
+            started = time.perf_counter()
             skip_animations(page)
-            prof["skip"] += time.perf_counter() - _t
+            self.metrics.count("skip", time.perf_counter() - started)
 
         # ここが本命: Enter 連打（待機なし）。
-        _t = time.perf_counter()
+        started = time.perf_counter()
         press_enter(page)
-        prof["enter"] += time.perf_counter() - _t
+        self.metrics.count("enter", time.perf_counter() - started)
 
         now = time.monotonic()
         # OK ボタンは exitCondition に Click が無いステップでも出るので、
         # 明確に詰まったときだけ 1 ステップ 1 回の保険として押す。
-        if now - last_change > 1.5 and step not in confirm_pressed:
+        if now - self.last_change > 1.5 and step not in self.confirm_pressed:
             if press_confirm_if_visible(page):
-                confirm_pressed.add(step)
-                last_change = time.monotonic()
-        if now - last_change > config.STUCK_GIVEUP_AFTER:
+                self.confirm_pressed.add(step)
+                self.last_change = time.monotonic()
+        if now - self.last_change > config.STUCK_GIVEUP_AFTER:
             log("画面が長時間変化しないため終了します。")
+            return ABORT
+        return NEXT
+
+    # --- 状態遷移 -----------------------------------------------------
+
+    def _advance(self, step, now):
+        log(f"ステップ {step} を通過しました。")
+        self.last_step = step
+        self.last_change = now
+        self.passed_steps = self.metrics.next_step(
+            step, now, self.structure, self.passed_steps
+        )
+
+    def _finish_after_navigation(self):
+        """SPA 遷移で実行コンテキストが消えたとき、完了画面になるまで待つ。"""
+        finished = poll.poll_true(
+            lambda: lesson_finished(self.page),
+            config.LESSON_PAGE_READY_TIMEOUT,
+            config.NAV_POLL_SEC,
+        )
+        if finished:
+            log_finish_speed(self.started_at, self.passed_steps)
+            return True
+        log("ページが遷移しましたが、終了画面を確認できませんでした。")
+        return False
+
+    def _finish_after_leave(self):
+        if lesson_finished(self.page):
+            log_finish_speed(self.started_at, self.passed_steps)
+            return True
+        log("レッスンページを離れたため終了します（完了画面は未確認）。")
+        return False
+
+    # --- メインループ -------------------------------------------------
+
+    def run(self):
+        page = self.page
+        page.set_default_timeout(config.ACTION_TIMEOUT_MS)
+        state = read_state(page)
+        if not state["in_lesson"]:
+            log(
+                "レッスンページが開かれていません。"
+                "ブラウザでレッスンを開いてから実行してください。"
+            )
             return False
 
-        human_sleep(calib_delays[calib_index] if calib_delays else config.ENTER_SPAM_DELAY)
+        self._install_injections()
+        self._load_data()
+        self.last_step = state["step"]
+        self.metrics.begin(self.last_step)
+        self.last_change = time.monotonic()
+        self.started_at = time.monotonic()
+        log(f"ステップ {self.last_step} から開始します。")
+
+        handlers = (
+            self._quiz_step,
+            self._free_input_step,
+            self._code_step,
+            self._click_step,
+            self._preview_step,
+        )
+        while True:
+            started = time.perf_counter()
+            try:
+                state = read_state(page)
+            except Exception as e:
+                if "Execution context was destroyed" in str(e):
+                    return self._finish_after_navigation()
+                raise
+            self.metrics.count("read", time.perf_counter() - started)
+            self.metrics.log_profile(self.started_at)
+
+            if not state["in_lesson"]:
+                return self._finish_after_leave()
+
+            # ステップ番号はシナリオ JSON（int）と突き合わせるので int にそろえる。
+            step = int(state["step"]) if state["step"] else None
+            now = time.monotonic()
+            if step != self.last_step:
+                self._advance(step, now)
+            self.metrics.observe(state, now)
+
+            result = self._quiz_step(state, step, now)
+            if result is None:
+                self._clear_quiz_tracking()
+                for handler in handlers[1:]:
+                    result = handler(step)
+                    if result is not None:
+                        break
+            if result is None:
+                result = self._progress(state, step, now)
+            if result == ABORT:
+                return False
+
+            human_sleep(self.metrics.delay())
+
+
+def _run_lesson_loop(page):
+    return LessonRunner(page).run()
 
 
 def auto_lesson():
