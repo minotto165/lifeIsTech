@@ -24,6 +24,10 @@ load_dotenv(os.path.join(PROJECT_DIR, ".env"))
 # 既定を 9300 にして環境変数で差し替えられるようにしている。
 CHROME_DEBUG_PORT = int(os.environ.get("LIFEISTECH_CHROME_PORT", "9300"))
 CDP_ENDPOINT = f"http://127.0.0.1:{CHROME_DEBUG_PORT}"
+# CDP 接続の再試行。Chrome 起動直後やプロファイル再読込の直後は、
+# "Browser context management is not supported" などで一時的に失敗することがある。
+CDP_CONNECT_RETRIES = 3
+CDP_CONNECT_RETRY_WAIT = 0.8
 # 起動する Chrome のプロファイル（ログイン状態はここに残る）
 CHROME_PROFILE_DIR = project_path(
     os.environ.get("LIFEISTECH_CHROME_PROFILE", "chrome_profile")
@@ -35,8 +39,25 @@ CHROME_STARTUP_TIMEOUT = 20.0
 LESSON_HOME_URL = "https://member.lifeistech-lesson.jp/home"
 # ログイン画面（b2clogin.com）だったときに、手動ログインを待つ上限（秒）
 LOGIN_WAIT_SEC = float(os.environ.get("LIFEISTECH_LOGIN_WAIT", "300"))
+# Azure AD B2C は URL だけ先に変わり、入力欄はそのあとで描画される。
+# 入力欄が出るまで待つ上限（秒）と、自動ログインをやり直す回数・間隔。
+LOGIN_FORM_WAIT_SEC = 15.0
+LOGIN_AUTO_ATTEMPTS = 3
+LOGIN_RETRY_WAIT_SEC = 5.0
+# 送信ボタンのクリックを待つ上限（ミリ秒）。通らなければ JS で押し直す。
+LOGIN_SUBMIT_TIMEOUT_MS = 5_000
+# 送信後、画面が動き出すまで待つ秒数と、押し直す回数
+LOGIN_SUBMIT_START_SEC = 3.0
+LOGIN_SUBMIT_TRIES = 2
+# ホームを開くときの上限（goto のタイムアウト）。開けたかどうかは URL で確認する。
+HOME_OPEN_TIMEOUT_MS = 30_000
+# 空タブのまま残っていないかを見る猶予と、開き直す回数
+HOME_OPEN_VERIFY_SEC = 5.0
+HOME_OPEN_ATTEMPTS = 3
 # ログイン済み判定に使うセッション cookie（member_api.py と共通）
 SESSION_COOKIE_NAME = "mozermovie"
+# cookie の JWT の期限がこの秒数以内なら「切れている」とみなす（実行中の失効を防ぐ）
+SESSION_EXPIRY_SKEW_SEC = 60.0
 # .env に書くとログイン画面で自動入力する（未設定なら手動ログインを待つ）
 LIFEISTECH_ID = os.environ.get("LIFEISTECH_ID", "")
 LIFEISTECH_PASSWORD = os.environ.get("LIFEISTECH_PASSWORD", "")

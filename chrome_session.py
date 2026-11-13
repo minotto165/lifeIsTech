@@ -1,9 +1,22 @@
 """起動済み Chrome への Playwright 接続を共通化するモジュール。"""
 
+import time
+
 from playwright.sync_api import sync_playwright
 
 import browser
 import config
+import ui
+
+# 起動直後・プロファイル再読込の直後の Chrome は、CDP のブラウザコンテキスト管理が
+# まだ整っておらず connect_over_cdp が一時的に失敗することがある。
+TRANSIENT_CDP_ERRORS = (
+    "Browser context management is not supported",
+    "Browser closed",
+    "Connection refused",
+    "ECONNREFUSED",
+    "WebSocket error",
+)
 
 
 def safe_page_url(page):
@@ -28,7 +41,7 @@ class ChromeSession:
         browser.ensure_chrome_running()
         self._playwright = sync_playwright().start()
         try:
-            self.browser = self._playwright.chromium.connect_over_cdp(config.CDP_ENDPOINT)
+            self.browser = self._connect_browser()
             if not self.browser.contexts:
                 raise RuntimeError("Chrome にブラウザコンテキストが見つかりません")
             context = self.browser.contexts[0]
@@ -45,6 +58,31 @@ class ChromeSession:
         except Exception:
             self.close()
             raise
+
+    def _connect_browser(self):
+        """一時的な CDP エラーなら数回やり直す。"""
+        last = None
+        for attempt in range(1, config.CDP_CONNECT_RETRIES + 1):
+            try:
+                return self._playwright.chromium.connect_over_cdp(config.CDP_ENDPOINT)
+            except Exception as exc:
+                last = exc
+                message = str(exc)
+                transient = any(word in message for word in TRANSIENT_CDP_ERRORS)
+                if not transient:
+                    raise
+                if attempt >= config.CDP_CONNECT_RETRIES:
+                    break
+                reason = message.splitlines()[0]
+                ui.out(
+                    f"Chrome への接続をやり直します（{attempt} 回目: {reason}）",
+                    "yellow",
+                )
+                time.sleep(config.CDP_CONNECT_RETRY_WAIT)
+        raise RuntimeError(
+            "Chrome との接続に失敗しました。Chrome を一度終了して起動し直してから、"
+            "もう一度実行してください。"
+        ) from last
 
     def _select_page(self, context):
         pages = context.pages
