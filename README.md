@@ -196,6 +196,45 @@ CLI の表示は [ui.py](ui.py) にまとめてあり、[rich](https://github.co
 `rich` が入っていない環境でも素の `print` に落ちてそのまま動きます。
 色を止めたいときは `NO_COLOR=1` を設定してください（`TERM=dumb` でも無効になります）。
 
+### MCP サーバーとして使う
+
+Claude Desktop / Codex などの MCP クライアントから、レッスンの一覧取得と実行を呼べます。
+
+```bash
+uv run python mcp_server.py    # 通常はクライアントが stdio で起動する
+```
+
+クライアントの設定例（Claude Desktop の `claude_desktop_config.json`）:
+
+```json
+{
+  "mcpServers": {
+    "lifeistech": {
+      "command": "/Users/minotto/dev/lifeIsTech/.venv/bin/python",
+      "args": ["/Users/minotto/dev/lifeIsTech/mcp_server.py"]
+    }
+  }
+}
+```
+
+| ツール | 説明 |
+| --- | --- |
+| `chrome_status` | CDP の接続状態・ログイン状態・実行中ジョブ |
+| `list_courses` | 受講中コースの一覧 |
+| `list_lessons` | レッスン一覧（`course` / `chapter` / `unfinished_only`） |
+| `start_lesson` | 1 本のレッスンを実行（`from_scratch` / `with_checkwork`） |
+| `start_checkwork` | 1 本の理解度チェックワークを実行 |
+| `start_auto` | 未完了レッスンを連続実行（`scope` / `chapter` / `limit`） |
+| `job_status` | ジョブの状態・結果・ログ末尾 |
+| `job_stop` | 実行中のジョブを停止 |
+| `list_jobs` | 最近のジョブ一覧 |
+
+- 実行は子プロセス（[jobrunner.py](jobrunner.py)）に任せ、ツールはすぐ `job_id` を返します。進捗は `job_status` でポーリングしてください。
+- 同時に動かせるジョブは 1 つです（同じ Chrome を同時に操作すると壊れるため）。実行中のジョブがあれば `start_*` はエラーになります。
+- 一覧系のツールは CDP に接続してセッション cookie を読むだけで、ページは遷移しません。Chrome が起動していないときは先に `uv run python main.py` を実行してください。
+- MCP サーバーの stdout は JSON-RPC 専用なので、ログは stderr とジョブごとのログファイルに出ます。サーバー自身の記録は `mcp_server.log`（プロジェクト直下）に残ります。
+- ジョブのログと結果は `.cache/mcp/jobs/` に残ります（`.gitignore` 済み）。
+
 ### 依存関係の更新
 
 ```bash
@@ -204,7 +243,7 @@ uv lock --upgrade     # 更新
 uv sync               # 環境へ反映
 ```
 
-ターミナル表示には `rich` を使っています（`uv add rich` 済み）。
+ターミナル表示には `rich` を、MCP サーバーには `mcp` を使っています（`uv add rich` / `uv add mcp` 済み）。
 
 ## 設定
 
@@ -314,6 +353,8 @@ EX① のような操作練習レッスンのプレビューは、iframe 内の�
 | `human_utils.py` | 待機・クリックの人間らしい揺らぎ |
 | `instance_guard.py` | 二重起動の防止（ロックファイル） |
 | `step_report.py` | ステップごとの所要時間ログの集計 |
+| `mcp_server.py` | MCP サーバー（stdio）。一覧取得とジョブ起動 |
+| `jobrunner.py` | MCP から起動されるジョブの実行本体 |
 | `ui.py` | CLI の表示（色分け・一覧表）。rich が無ければ素の print |
 | `config.py` | 設定とセレクタの集約 |
 | `pyproject.toml` | プロジェクト定義・依存関係 |
