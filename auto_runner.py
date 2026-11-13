@@ -456,6 +456,61 @@ STATUS_LABELS = {
 }
 
 
+def run_targets(api, context, page, targets, stop_on_failure=False, on_progress=None):
+    """レッスンの一覧を順に実行し、結果を分類して返す。
+
+    MCP サーバーのジョブからも呼ぶため、集計と表示を分けてある。
+    on_progress(index, total, target, result) は 1 本終わるたびに呼ばれる。
+    """
+    done = []
+    skipped = []
+    failed = []
+    total = len(targets)
+    for index, target in enumerate(targets, 1):
+        result = run_one(api, context, page, target, index, total)
+        if result == RESULT_DONE:
+            done.append(target)
+        elif result == RESULT_SKIPPED:
+            # 完了ではないので done に数えず、スキップとして記録する。
+            skipped.append(target)
+            log(f"「{target.name}」は公開されていないため、スキップします。")
+        else:
+            failed.append(target)
+            if on_progress is not None:
+                on_progress(index, total, target, result)
+            if stop_on_failure:
+                log("")
+                log(f"「{target.name}」で停止しました。原因を確認して再実行してください。")
+                break
+            log(f"「{target.name}」は自動化できませんでした（未完了のまま次へ進みます）。")
+            continue
+        if on_progress is not None:
+            on_progress(index, total, target, result)
+    return {"done": done, "skipped": skipped, "failed": failed}
+
+
+def print_summary(results):
+    """run_targets の結果を表示する。"""
+    done = results["done"]
+    skipped = results["skipped"]
+    failed = results["failed"]
+    total = len(done) + len(skipped) + len(failed)
+    log("")
+    log(
+        f"完了 {len(done)} 件 / スキップ {len(skipped)} 件 / 失敗 {len(failed)} 件"
+        f"（対象 {total} 件）。"
+    )
+    if skipped:
+        log(f"公開されておらずスキップしたレッスン（{len(skipped)} 件）:")
+        for target in skipped:
+            log(f"  - {target.name} ({target.lesson_id})")
+    if failed:
+        log(f"自動化できなかったレッスン（{len(failed)} 件）:")
+        for target in failed:
+            log(f"  - {target.name} ({target.lesson_id})")
+        log("これらは手動で進めるか、原因を確認してから再実行してください。")
+
+
 def status_label(status):
     return STATUS_LABELS.get(status, status or "?")
 
@@ -643,42 +698,11 @@ def main(argv=None):
             exit_code = 0
             return exit_code
 
-        done = 0
-        skipped = []
-        failed = []
-        for index, target in enumerate(targets, 1):
-            result = run_one(api, context, page, target, index, len(targets))
-            if result == RESULT_DONE:
-                done += 1
-                continue
-            if result == RESULT_SKIPPED:
-                # 完了ではないので done に数えず、スキップとして記録する。
-                skipped.append(target)
-                log(f"「{target.name}」は公開されていないため、スキップします。")
-                continue
-            failed.append(target)
-            if args.stop_on_failure:
-                log("")
-                log(f"「{target.name}」で停止しました。原因を確認して再実行してください。")
-                exit_code = 1
-                return exit_code
-            log(f"「{target.name}」は自動化できませんでした（未完了のまま次へ進みます）。")
-
-        log("")
-        log(
-            f"完了 {done} 件 / スキップ {len(skipped)} 件 / 失敗 {len(failed)} 件"
-            f"（対象 {len(targets)} 件）。"
+        results = run_targets(
+            api, context, page, targets, stop_on_failure=args.stop_on_failure
         )
-        if skipped:
-            log(f"公開されておらずスキップしたレッスン（{len(skipped)} 件）:")
-            for target in skipped:
-                log(f"  - {target.name} ({target.lesson_id})")
-        if failed:
-            log(f"自動化できなかったレッスン（{len(failed)} 件）:")
-            for target in failed:
-                log(f"  - {target.name} ({target.lesson_id})")
-            log("これらは手動で進めるか、原因を確認してから再実行してください。")
-        exit_code = 0
+        print_summary(results)
+        exit_code = 1 if args.stop_on_failure and results["failed"] else 0
     except AuthError as e:
         log(str(e))
     except MemberApiError as e:

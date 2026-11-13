@@ -4,8 +4,20 @@ import os
 
 from dotenv import load_dotenv
 
+# プロジェクト直下。MCP クライアントのように任意の cwd から起動されても
+# .env・Chrome プロファイル・スクリーンショットが同じ場所を指すようにする。
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def project_path(value):
+    """相対パスならプロジェクト直下を基準に解決する（絶対パスはそのまま）。"""
+    if not value:
+        return value
+    return value if os.path.isabs(value) else os.path.join(PROJECT_DIR, value)
+
+
 # .env を先に読み込む（各スクリプトは config を最初に import するため）
-load_dotenv()
+load_dotenv(os.path.join(PROJECT_DIR, ".env"))
 
 # --- Chrome / CDP ---
 # 9222 は他のツール（DSH の内蔵ブラウザ等）が使っていることがあるため、
@@ -13,7 +25,9 @@ load_dotenv()
 CHROME_DEBUG_PORT = int(os.environ.get("LIFEISTECH_CHROME_PORT", "9300"))
 CDP_ENDPOINT = f"http://127.0.0.1:{CHROME_DEBUG_PORT}"
 # 起動する Chrome のプロファイル（ログイン状態はここに残る）
-CHROME_PROFILE_DIR = os.environ.get("LIFEISTECH_CHROME_PROFILE", "chrome_profile")
+CHROME_PROFILE_DIR = project_path(
+    os.environ.get("LIFEISTECH_CHROME_PROFILE", "chrome_profile")
+)
 # ヘッドレスで起動する（LIFEISTECH_HEADLESS=1）。画面は出ないが CDP 操作は同じ。
 # 手動ログインができないので、セッション切れ対策に .env の ID / パスワードを推奨。
 HEADLESS = os.environ.get("LIFEISTECH_HEADLESS", "0") not in ("0", "", "false", "False")
@@ -238,11 +252,18 @@ CODE_CHECK_WAIT = 2.0
 CODE_VERIFY_APPLIED = True
 
 # 停止時のスクリーンショット置き場（実行ユーザーだけが読める 0700 で作る）。
-SCREENSHOT_DIR = "screenshots"
+SCREENSHOT_DIR = project_path("screenshots")
 # 残す枚数の上限（古いものから消す）。
 SCREENSHOT_KEEP = 30
 # 同じ Chrome に複数プロセスが接続しないためのロックファイル。
 LOCK_FILE = ".lifeistech.lock"
+
+# --- MCP サーバー (mcp_server.py) ---
+# ジョブのログと結果 JSON の置き場（プロジェクト直下の .cache 配下）。
+MCP_JOB_DIR = project_path(".cache/mcp/jobs")
+# job_status が返すログ末尾の行数と、その最大文字数。
+MCP_LOG_TAIL_LINES = 40
+MCP_LOG_TAIL_MAX_CHARS = 4000
 
 # プレイヤーではなくワーク画面に遷移したかを見る URL の目印。
 WORK_PAGE_MARKER = "variant_check_work"

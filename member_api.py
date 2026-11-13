@@ -11,9 +11,11 @@ import urllib.request
 from dataclasses import dataclass
 
 import config
+import ui
 
 MEMBER_ORIGIN = "https://member.lifeistech-lesson.jp"
-COOKIE_NAME = "mozermovie"
+# セッション cookie の名前は config 側に一本化してある。
+COOKIE_NAME = config.SESSION_COOKIE_NAME
 STATUS_CLEARED = "cleared"
 STATUS_LOCKED = "locked"
 
@@ -202,7 +204,7 @@ def iter_lessons(api, course, scope="chapter", chapter_label=None):
             if target.status == STATUS_CLEARED:
                 continue
             if target.status == STATUS_LOCKED:
-                print(f"ロック中のためスキップします: {target.name}", flush=True)
+                ui.log(f"ロック中のためスキップします: {target.name}")
                 continue
             pending.append(target)
         if not pending:
@@ -211,6 +213,33 @@ def iter_lessons(api, course, scope="chapter", chapter_label=None):
         if scope == "chapter":
             break
     return targets
+
+
+def resolve_lesson(api, course, lesson_id, chapter_id=None):
+    """レッスン ID から LessonTarget を引く（完了済み・ロック中も返す）。
+
+    chapter_id を渡すとその章だけを見る。見つからなければ None。
+    MCP サーバーの start_lesson / start_checkwork から使う。
+    """
+    lesson_id = int(lesson_id)
+    if chapter_id:
+        detail = api.chapter(int(chapter_id))
+        if detail is None:
+            return None
+        course_chapters = {
+            c.get("id"): c for c in (course.get("chapters") or [])
+        }
+        detail = {**course_chapters.get(int(chapter_id), {}), **detail}
+        if not detail.get("textbook_id"):
+            detail["textbook_id"] = (course.get("textbook") or {}).get("id")
+        for lesson in detail.get("lessons") or []:
+            if int(lesson.get("id") or 0) == lesson_id:
+                return to_target(detail, lesson)
+        return None
+    for target in list_all_lessons(api, course):
+        if target.lesson_id == lesson_id:
+            return target
+    return None
 
 
 def list_all_lessons(api, course, chapter_label=None):

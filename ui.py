@@ -5,14 +5,20 @@ rich が入っていない環境でもそのまま動くように、無いとき
 成功・失敗・警告は色で区別できるようにしている。
 """
 
+import os
 import re
+import sys
+
+# MCP サーバーは stdout を JSON-RPC 専用に使うため、ログは stderr へ逃がす。
+# mcp_server.py が config より先にこの環境変数を立てる。
+_LOG_TO_STDERR = os.environ.get("LIFEISTECH_LOG_STREAM", "").lower() == "stderr"
 
 try:
     from rich.console import Console
     from rich.table import Table
     from rich.text import Text
 
-    _console = Console(highlight=False)
+    _console = Console(highlight=False, stderr=_LOG_TO_STDERR)
 except Exception:  # pragma: no cover - rich が無い環境向け
     _console = None
     Table = None
@@ -76,7 +82,7 @@ def out(message="", style=None):
     if style is None:
         style = style_for(text)
     if _console is None:
-        print(text, flush=True)
+        print(text, file=sys.stderr if _LOG_TO_STDERR else sys.stdout, flush=True)
         return
     _console.print(Text(text, style=style))
 
@@ -93,7 +99,7 @@ def blank():
 def header(text):
     """見出し（太字＋下線代わりの罫線）。"""
     if _console is None:
-        print(f"--- {text} ---", flush=True)
+        print(f"--- {text} ---", file=sys.stderr if _LOG_TO_STDERR else sys.stdout, flush=True)
         return
     _console.rule(Text(str(text), style="bold"), style="cyan")
 
@@ -106,9 +112,10 @@ def chapter(text):
 def menu(title, items):
     """キーと説明の 2 列メニュー。"""
     if _console is None:
-        print(title, flush=True)
+        stream = sys.stderr if _LOG_TO_STDERR else sys.stdout
+        print(title, file=stream, flush=True)
         for key, label in items:
-            print(f"{key}: {label}", flush=True)
+            print(f"{key}: {label}", file=stream, flush=True)
         return
     table = Table(show_header=False, box=None, padding=(0, 2), expand=False)
     table.add_column(justify="right", style="bold cyan", no_wrap=True)
@@ -134,7 +141,8 @@ def lesson_table(rows):
     """
     if _console is None:
         for index, label, title, status in rows:
-            print(f"{index:3d}. {label}{title} [{status}]", flush=True)
+            stream = sys.stderr if _LOG_TO_STDERR else sys.stdout
+            print(f"{index:3d}. {label}{title} [{status}]", file=stream, flush=True)
         return
     table = Table(show_header=False, box=None, padding=(0, 1), expand=False)
     table.add_column(justify="right", style="dim", no_wrap=True)
