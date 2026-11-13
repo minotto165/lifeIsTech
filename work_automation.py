@@ -6,36 +6,26 @@ import random
 import re
 import sys
 import time
+from contextlib import suppress
 
 import config
-import ui
 from ai_analyzer import get_ai_response, get_ai_response_with_images
 from chrome_session import ChromeSession
+from dom import log, normalize
 from human_utils import human_click
 from instance_guard import acquire as acquire_instance
-
-
-def log(message):
-    ui.log(message)
-
-
-def count(page, selector):
-    try:
-        return page.locator(selector).count()
-    except Exception:
-        return 0
-
-
-def normalize(text):
-    return re.sub(r"\s+", "", text or "")
+from poll import poll_true, poll_until
 
 
 def grade_state(page):
     """採点ボタンの有無と押せるかどうか（全問回答するまで無効）。"""
-    try:
-        return page.evaluate(GRADE_STATE_JS, config.GRADE_BTN_TEXT)
-    except Exception:
-        return {"found": False, "enabled": False}
+    state = {"found": False, "enabled": False}
+    # 画面遷移の直後は evaluate が失敗する（想定内）。呼び出し側のポーリングで再試行する。
+    with suppress(Exception):
+        state = page.evaluate(GRADE_STATE_JS, config.GRADE_BTN_TEXT)
+    if not isinstance(state, dict):
+        state = {"found": False, "enabled": False}
+    return state
 
 
 def grade_ready(page):
@@ -46,12 +36,13 @@ def click_if_present(page, selector, base_delay=1.0, timeout_ms=config.ACTION_CL
     locator = page.locator(selector)
     if locator.count() == 0:
         return False
-    try:
-        # disabled を押しに行くと Playwright が待ち時間いっぱい粘るので先に弾く。
-        if locator.first.is_disabled():
-            return False
-    except Exception:
-        pass
+    # disabled を押しに行くと Playwright が待ち時間いっぱい粘るので先に弾く。
+    disabled = False
+    # 判定できないときは押せる前提で進む（押せなければ human_click 側が失敗する）。
+    with suppress(Exception):
+        disabled = locator.first.is_disabled()
+    if disabled:
+        return False
     try:
         human_click(locator.first, base_delay=base_delay, timeout_ms=timeout_ms)
         return True
@@ -73,12 +64,39 @@ GRADE_STATE_JS = """(text) => {
   return { found: !!btn, enabled: !!btn && !btn.disabled };
 }"""
 
-SELECT_OPTION_JS = """(index) => {
+# クリックしたあとの状態を必ず読む。無条件に true を返すと click_option が
+# 成功と誤認し、human_click へのフォールバックが一度も働かなくなる。
+SELECT_OPTION_JS = r"""(index) => {
   const inputs = [...document.querySelectorAll('input[type="radio"], input[type="checkbox"]')];
   const input = inputs[index];
   if (!input) return false;
-  (input.closest('label') || input).click();
-  return true;
+  const label = input.closest('label');
+  (label || input).click();
+  if (input.checked) return true;
+  if (input.getAttribute('aria-checked') === 'true') return true;
+  const marked = (el) => {
+    if (!el) return false;
+    const cls = el.className || '';
+    return /(^|[\s_-])(selected|checked)([\s_-]|$)/i.test(cls);
+  };
+  return marked(label) || marked(input.parentElement);
+}"""
+
+# 「選択肢が選ばれている」の唯一の判定。has_selection / wait_selected で共用する。
+SELECTION_JS = r"""() => {
+  const inputs = [...document.querySelectorAll('input[type="radio"], input[type="checkbox"]')];
+  const marked = (el) => {
+    if (!el) return false;
+    const cls = el.className || '';
+    return /(^|[\s_-])(selected|checked)([\s_-]|$)/i.test(cls);
+  };
+  return inputs.some(
+    (input) =>
+      input.checked ||
+      input.getAttribute('aria-checked') === 'true' ||
+      marked(input.closest('label')) ||
+      marked(input.parentElement)
+  );
 }"""
 
 
@@ -88,10 +106,10 @@ def collect_options(page):
     テキストを持たず画像だけの選択肢（コードの正誤を選ぶ問題など）もあるため、
     その場合は img の alt を表示名にし、画像であることを覚えておく。
     """
-    try:
+    raw = []
+    # 画面遷移中は evaluate が失敗する（想定内）。呼び出し側のポーリングで再試行する。
+    with suppress(Exception):
         raw = page.evaluate(COLLECT_OPTIONS_JS)
-    except Exception:
-        return []
     options = []
     for item in raw:
         text = (item.get("text") or "").strip()
@@ -154,7 +172,11 @@ def read_answer_cache():
     try:
         with open(answer_cache_path(), encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        # 初回はまだキャッシュが無い（正常）。
+        return {}
+    except Exception as e:
+        log(f"解答キャッシュを読み込めませんでした: {e}")
         return {}
 
 
@@ -183,16 +205,29 @@ def cached_answer(text, options, prompt):
 
 
 CARD_JS = """() => {
+  // 前の問題で付けた目印が残っていると screenshot の対象が二重になる。
+  document.querySelectorAll('[data-lt-card]').forEach((el) => el.removeAttribute('data-lt-card'));
   const labs = [...document.querySelectorAll('label')].filter(
     (l) => l.querySelector('input[type="radio"], input[type="checkbox"]')
   );
   if (!labs.length) return null;
-  let root = labs[0];
+  const first = labs[0];
+  let root = first;
+  let found = false;
   for (let i = 0; i < 12; i++) {
     const t = root.innerText || '';
-    if (t.includes('次へ進む') || t.includes('この内容で採点する')) break;
-    if (!root.parentElement) break;
+    if (t.includes('次へ進む') || t.includes('この内容で採点する')) { found = true; break; }
+    if (!root.parentElement || root === document.body) break;
     root = root.parentElement;
+  }
+  // ボタンを含む祖先が見つからない（描画途中など）ときは html/body まで登らず、
+  // 選択肢を包む祖先で止める。body を撮ると画面全体になり AI も解けない。
+  if (!found || root === document.body || root === document.documentElement) {
+    root = first.parentElement || first;
+    for (let i = 0; i < 6 && root.parentElement; i++) {
+      if (root.querySelectorAll('img').length) break;
+      root = root.parentElement;
+    }
   }
   root.setAttribute('data-lt-card', '1');
   return {
@@ -207,7 +242,8 @@ def mark_quiz_card(page):
     """設問カード（問題文＋選択肢）に目印を付け、画像の有無を返す。"""
     try:
         return page.evaluate(CARD_JS)
-    except Exception:
+    except Exception as e:
+        log(f"設問カードの目印付けに失敗しました: {e}")
         return None
 
 
@@ -254,8 +290,9 @@ def answer_question(page):
         # 設問カードを丸ごと画像にして AI に読ませ、選択肢の番号で受け取る。
         try:
             png = page.locator("[data-lt-card='1']").screenshot()
-        except Exception:
+        except Exception as e:
             png = None
+            log(f"設問カードの画像化に失敗しました: {e}")
         if png:
             labels = "\n".join(f"{i + 1}. {o['text']}" for i, o in enumerate(options))
             prompt = (
@@ -290,12 +327,16 @@ def answer_question(page):
 
 
 def click_option(page, option):
-    """選択肢を 1 往復の JS でクリックし、駄目なら通常クリックで押し直す。"""
+    """選択肢を 1 往復の JS でクリックし、駄目なら通常クリックで押し直す。
+
+    JS は押したあとの選択状態まで確認して返す。反映されていなければ
+    （または JS 自体が失敗したら）human_click で押し直す。
+    """
     try:
         if page.evaluate(SELECT_OPTION_JS, option["index"]):
             return True
-    except Exception:
-        pass
+    except Exception as err:
+        log(f"JS での選択に失敗したため通常クリックで押し直します: {err}")
     try:
         human_click(
             page.locator('input[type="radio"], input[type="checkbox"]').nth(option["index"]),
@@ -327,43 +368,39 @@ def go_next(page, grade_only_if_ready=False):
 
 def has_selection(page):
     """いまの設問で選択肢が選ばれているか。1 往復で判定する。"""
-    try:
-        return bool(
-            page.evaluate(
-                "() => !!document.querySelector('input[type=radio]:checked, input[type=checkbox]:checked')"
-            )
-        )
-    except Exception:
-        return False
+    selected = False
+    # 画面遷移中は evaluate が失敗する（想定内）。呼び出し側のポーリングで再試行する。
+    with suppress(Exception):
+        selected = bool(page.evaluate(SELECTION_JS))
+    return selected
 
 
 def wait_unselected(page, timeout=None):
     """次の設問が描画されて選択が外れるまで待つ（二重に進めないため）。"""
-    end = time.monotonic() + (config.WORK_STEP_TIMEOUT if timeout is None else timeout)
-    while time.monotonic() < end:
-        if not has_selection(page):
-            return True
-        time.sleep(config.FAST_POLL_SEC)
-    return False
-
-
-def grade_visible(page):
-    return count(page, config.SEL_WORK_GRADE_BTN) > 0
+    return poll_true(
+        lambda: not has_selection(page),
+        config.WORK_STEP_TIMEOUT if timeout is None else timeout,
+    )
 
 
 def already_graded(page):
     """採点結果の画面かどうか（もう一度チャレンジするリンクが出ている）。"""
-    try:
-        return page.evaluate(
-            "() => document.body.innerText.includes('このワークをもう一度チャレンジする')"
+    graded = False
+    # 読めないときは未採点として進む（呼び出し側が採点ボタンで再判定する）。
+    with suppress(Exception):
+        graded = bool(
+            page.evaluate(
+                "() => document.body.innerText.includes('このワークをもう一度チャレンジする')"
+            )
         )
-    except Exception:
-        return False
+    return graded
 
 
-def press_grade(page):
+def press_grade(page, state=None):
+    """採点ボタンを押す。state を渡すと grade_state の再取得を省く。"""
     # 未回答があるとボタンは disabled なので、押せるようになってから押す。
-    if not grade_ready(page):
+    state = grade_state(page) if state is None else state
+    if not state["enabled"]:
         return False
     if click_if_present(
         page,
@@ -376,71 +413,28 @@ def press_grade(page):
     return False
 
 
-def wait_selected(page, timeout=2.0):
-    """選択肢のクリックが反映される（input が checked になる）まで待つ。"""
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        try:
-            if page.evaluate("() => !!document.querySelector('label input:checked')"):
-                return True
-        except Exception:
-            pass
-        time.sleep(config.FAST_POLL_SEC)
-    return False
+def wait_selected(page, timeout=config.WORK_SELECT_TIMEOUT):
+    """選択肢のクリックが反映される（選択済みになる）まで待つ。"""
+    return poll_true(lambda: has_selection(page), timeout)
 
 
-def wait_work_ready(page, timeout=10.0):
+def wait_work_ready(page, timeout=config.WORK_READY_TIMEOUT):
     """チェックワークの設問（または採点ボタン）が描画されるまで待つ。"""
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        if grade_ready(page) or (question_text(page) and collect_options(page)):
-            return True
-        time.sleep(config.FAST_POLL_SEC)
-    return False
+    return poll_true(
+        lambda: grade_ready(page) or bool(question_text(page) and collect_options(page)),
+        timeout,
+    )
 
 
 def question_text(page):
     """いま表示されている問題文（無ければ None）。1 往復で読む。"""
-    try:
+    text = ""
+    # 画面遷移中は要素が無い／読めない（想定内）。呼び出し側のポーリングで再試行する。
+    with suppress(Exception):
         locs = page.locator(config.SEL_WORK_QUESTION)
-        if locs.count() <= config.WORK_QUESTION_INDEX:
-            return None
-        text = locs.nth(config.WORK_QUESTION_INDEX).inner_text().strip()
-    except Exception:
-        return None
+        if locs.count() > config.WORK_QUESTION_INDEX:
+            text = locs.nth(config.WORK_QUESTION_INDEX).inner_text().strip()
     return text or None
-
-
-def option_texts(page):
-    """表示中の選択肢の文言（描画順は問ごとに変わるので比較時は並べ替える）。"""
-    return [o["text"] for o in collect_options(page)]
-
-
-def question_key(page):
-    """問題文と選択肢をまとめた識別子。
-
-    描画の途中では「前の問題文のまま選択肢だけ消える」瞬間があるため、
-    問題文と選択肢が揃ったときだけ識別子を返す。
-    """
-    text = question_text(page)
-    if text is None:
-        return None
-    options = option_texts(page)
-    if not options:
-        return None
-    return (text, tuple(sorted(options)))
-
-
-def wait_question_change(page, key, timeout=None):
-    """設問（問題文＋選択肢）が切り替わるか採点ボタンが出るまで待つ。"""
-    end = time.monotonic() + (config.WORK_STEP_TIMEOUT if timeout is None else timeout)
-    while time.monotonic() < end:
-        if grade_ready(page):
-            return "grade"
-        if question_key(page) != key:
-            return "changed"
-        time.sleep(config.FAST_POLL_SEC)
-    return None
 
 
 def run_work(page):
@@ -453,13 +447,15 @@ def run_work(page):
         if already_graded(page):
             log("このチェックワークは採点済みです。")
             return True
-        if not wait_work_ready(page, config.LESSON_PAGE_READY_TIMEOUT):
+        if not wait_work_ready(page, config.WORK_PAGE_READY_TIMEOUT):
             log("理解度チェックワークの画面が表示されませんでした。")
             return False
         stalled = 0
         for _ in range(config.MAX_WORK_STEPS):
-            if grade_ready(page):
-                return press_grade(page)
+            # grade_state を 1 回だけ引き、判定と採点で同じ結果を使い回す。
+            state = grade_state(page)
+            if state["enabled"]:
+                return press_grade(page, state)
 
             if has_selection(page):
                 # 回答済みなので次の設問へ。押したあとは選択が消える（＝次の設問が
@@ -481,18 +477,18 @@ def run_work(page):
                 stalled = 0
                 continue
 
-            # 未回答。選択肢が揃うまで待ってから選ぶ。
-            end = time.monotonic() + config.WORK_STEP_TIMEOUT
-            while time.monotonic() < end:
-                if grade_ready(page):
-                    return press_grade(page)
-                if collect_options(page):
-                    break
-                time.sleep(config.FAST_POLL_SEC)
-            if not collect_options(page):
-                if press_grade(page):
+            # 未回答。選択肢が揃うまで待ち、揃った選択肢の取得結果をそのまま使う。
+            options = poll_until(
+                lambda: "grade" if grade_ready(page) else (collect_options(page) or None),
+                config.WORK_STEP_TIMEOUT,
+            )
+            if options == "grade":
+                return press_grade(page)
+            if not options:
+                state = grade_state(page)
+                if press_grade(page, state):
                     return True
-                if grade_state(page)["found"]:
+                if state["found"]:
                     log("未解答の問題が残っているため採点できません。")
                     return False
                 log("設問を取得できなかったため終了します。")
