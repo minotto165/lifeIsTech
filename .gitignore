@@ -7,6 +7,7 @@ chrome_profile/
 .DS_Store
 
 # 実行時の生成物
+.cache/
 screenshots/
 .lifeistech.lock
 *.log

@@ -1,5 +1,6 @@
 """回答生成モジュール（OpenCode Go / Gemini）。"""
 
+import base64
 import json
 import os
 import time
@@ -49,8 +50,27 @@ def _post_json(url, payload, headers, timeout):
         return json.loads(response.read().decode("utf-8"))
 
 
-def ask_opencode_go(prompt):
-    """OpenCode Go で回答を生成する。使えないときは None。"""
+def _content_blocks(prompt, image_pngs):
+    """テキスト＋画像を OpenAI 互換の content 形式にする。"""
+    if not image_pngs:
+        return prompt
+    blocks = [{"type": "text", "text": prompt}]
+    for png in image_pngs:
+        encoded = base64.b64encode(png).decode("ascii")
+        blocks.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64," + encoded},
+            }
+        )
+    return blocks
+
+
+def ask_opencode_go(prompt, image_pngs=None):
+    """OpenCode Go で回答を生成する。使えないときは None。
+
+    image_pngs を渡すと画像も一緒に送る（Muse Spark は画像入力に対応）。
+    """
     global _go_disabled_reason
     if _go_disabled_reason:
         return None
@@ -67,7 +87,7 @@ def ask_opencode_go(prompt):
 
     payload = {
         "model": config.OPENCODE_GO_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": _content_blocks(prompt, image_pngs)}],
         "temperature": 0,
         "max_tokens": config.OPENCODE_GO_MAX_TOKENS,
     }
@@ -187,7 +207,41 @@ def ask_gemini(prompt):
     return None
 
 
+def ask_gemini_with_images(prompt, image_pngs):
+    client = _get_gemini_client()
+    if client is None:
+        return None
+    try:
+        from google.genai import types
+
+        parts = [types.Part.from_text(text=prompt)]
+        for png in image_pngs:
+            parts.append(types.Part.from_bytes(data=png, mime_type="image/png"))
+        response = client.models.generate_content(
+            model=config.GEMINI_MODEL,
+            contents=[types.Content(role="user", parts=parts)],
+        )
+        text = (response.text or "").strip()
+        return text or None
+    except Exception as e:
+        print(f"Gemini 画像解析エラー: {e}", flush=True)
+        return None
+
+
 # --- 公開 API --------------------------------------------------------
+
+
+def get_ai_response_with_images(prompt, image_pngs):
+    """画像つきで回答を生成する。失敗時は None。"""
+    if not image_pngs:
+        return get_ai_response(prompt)
+    if config.AI_PROVIDER == "opencode_go":
+        text = ask_opencode_go(prompt, image_pngs)
+        if text is not None:
+            return text
+        if not config.AI_FALLBACK_TO_GEMINI:
+            return None
+    return ask_gemini_with_images(prompt, image_pngs)
 
 
 def get_ai_response(prompt):
