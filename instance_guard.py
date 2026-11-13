@@ -1,9 +1,15 @@
 """同じ Chrome に対して自動化プロセスが同時に走らないようにするガード。"""
 
 import atexit
+import contextlib
 import os
 
 import config
+
+try:
+    import fcntl
+except ImportError:  # Windows には fcntl が無い（多重起動ガードは効かせない）
+    fcntl = None
 
 _handle = None
 
@@ -19,9 +25,7 @@ def acquire():
     fcntl が無い環境（Windows）では何もしない。
     """
     global _handle
-    try:
-        import fcntl
-    except ImportError:
+    if fcntl is None:
         return True
     if _handle is not None:
         return True
@@ -48,14 +52,13 @@ def release():
     global _handle
     if _handle is None:
         return
-    try:
-        import fcntl
-
-        fcntl.flock(_handle.fileno(), fcntl.LOCK_UN)
-    except Exception:
-        pass
-    try:
+    if fcntl is not None:
+        try:
+            fcntl.flock(_handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            # 解放に失敗してもプロセス終了で OS がロックを外すため、ここでは黙って続行する。
+            pass
+    # 終了時の後始末なので、close の失敗は握り潰してよい（OS が後始末する）。
+    with contextlib.suppress(OSError):
         _handle.close()
-    except Exception:
-        pass
     _handle = None

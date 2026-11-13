@@ -8,12 +8,11 @@ import urllib.error
 import urllib.request
 import uuid
 
-from dotenv import load_dotenv
-from google import genai
-
 import config
 
-load_dotenv()
+# .env の読み込みは config.py が済ませているので、ここでは呼ばない。
+# Gemini のライブラリ（google-genai）は opencode_go 運用時に読み込みたくないため、
+# 実際に Gemini を使う _get_gemini_client() の中で遅延 import する。
 
 _gemini_client = None
 _gemini_initialized = False
@@ -33,7 +32,12 @@ def _opencode_go_key():
     try:
         with open(os.path.expanduser(config.OPENCODE_GO_AUTH_PATH), encoding="utf-8") as f:
             data = json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        # 認証ファイルが無いだけなら、呼び出し側がキー未設定として案内する。
+        return None
+    except (OSError, ValueError) as e:
+        # 壊れた JSON や読めないファイルを黙って「キー無し」にすると原因が分からない。
+        print(f"OpenCode Go の認証情報を読めませんでした: {e}", flush=True)
         return None
     entry = data.get("opencode-go") or {}
     return (entry.get("key") or "").strip() or None
@@ -127,7 +131,8 @@ def ask_opencode_go(prompt, image_pngs=None):
             try:
                 detail = e.read().decode("utf-8", "replace")[:300]
             except Exception:
-                pass
+                # 本文が読めなくてもステータスコードだけで原因は判断できる。
+                detail = ""
             if e.code in (401, 403):
                 # キーが無効なら毎問リトライしても無駄なので、この実行では諦める。
                 _go_disabled_reason = f"認証エラー {e.code}"
@@ -155,6 +160,7 @@ def _build_http_options():
 
         return types.HttpOptions(timeout=config.GEMINI_TIMEOUT_MS)
     except Exception:
+        # types が無い／オプション未対応の環境では既定のタイムアウトで動かす。
         return None
 
 
@@ -167,6 +173,14 @@ def _get_gemini_client():
     api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
         # キーが無い状態は何度試しても変わらないので、以後は問い合わせない。
+        _gemini_initialized = True
+        return None
+
+    try:
+        from google import genai
+    except Exception as e:
+        print(f"Gemini ライブラリを読み込めませんでした: {e}", flush=True)
+        # 依存が無い環境では何度試しても同じ結果になるため、ここで確定させる。
         _gemini_initialized = True
         return None
 

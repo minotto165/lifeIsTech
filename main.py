@@ -9,7 +9,7 @@ import browser
 import config
 import ui
 
-# 値は (表示名, スクリプト名, 起動時に渡す引数) の 3 要素。引数は省略できる。
+# 値は (表示名, スクリプト名[, 起動時に渡す引数]) の 2〜3 要素。引数は省略できる。
 MENU = {
     "1": ("レッスン自動化", "lifeistech_auto.py"),
     "2": ("理解度チェックワーク", "work_automation.py"),

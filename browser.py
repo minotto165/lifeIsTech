@@ -4,6 +4,7 @@ main.py からも各スクリプト（lifeistech_auto.py / auto_runner.py など
 同じ手順で使えるように、起動まわりの処理をここへ集約している。
 """
 
+import contextlib
 import json
 import os
 import platform
@@ -56,6 +57,7 @@ def wait_for_page_ready(timeout=None):
             with urllib.request.urlopen(url, timeout=2) as res:
                 pages = json.loads(res.read() or b"[]")
         except Exception:
+            # 起動直後はまだ接続できないのが正常なので、待機を続ける。
             pages = []
         # 初回起動のプロファイルでは chrome://intro/ が開くことがあるので、
         # URL は問わずタブが 1 枚でもあれば「起動した」とみなす。
@@ -71,11 +73,17 @@ def profile_owner_pid():
     lock = os.path.join(os.path.abspath(config.CHROME_PROFILE_DIR), "SingletonLock")
     try:
         target = os.readlink(lock)
-    except OSError:
+    except FileNotFoundError:
+        # ロックファイルが無い＝このプロファイルを使っている Chrome はいない（正常）。
+        return None
+    except OSError as exc:
+        # ここで黙って None を返すと、別プロファイルの Chrome に繋いでしまう。
+        ui.out(f"プロファイルのロックを読めませんでした（{exc}）。", "yellow")
         return None
     try:
         return int(str(target).rsplit("-", 1)[1])
     except (IndexError, ValueError):
+        ui.out("プロファイルのロックから PID を読み取れませんでした。", "yellow")
         return None
 
 
@@ -150,12 +158,11 @@ def ensure_chrome_running():
 
 def current_href(page):
     """page.url は pushState やリダイレクトの途中で古いことがあるので、DOM から読む。"""
-    try:
+    # 遷移中は evaluate が失敗するのが普通なので、その場合は page.url で妥協する。
+    with contextlib.suppress(Exception):
         href = page.evaluate("() => location.href")
         if href:
             return href
-    except Exception:
-        pass
     try:
         return page.url or ""
     except Exception:
@@ -168,8 +175,12 @@ def open_home_if_blank(page):
     if href and href.startswith("about:"):
         try:
             page.goto(config.LESSON_HOME_URL, wait_until="domcontentloaded")
-        except Exception:
-            pass
+        except Exception as exc:
+            # 開けなくても現在のページのままログイン判定・遷移を続けられる。
+            ui.out(
+                f"ホームページを開けませんでした（{exc}）。現在のページのまま続行します。",
+                "yellow",
+            )
     return page
 
 
@@ -179,25 +190,36 @@ def needs_login(page):
     if LOGIN_HOST in href:
         return True
     # リダイレクト途中は URL がまだ会員サイトのままなので、本文でも判定する。
-    try:
+    # これは補助判定なので、失敗しても URL 判定の結果（False）で構わない。
+    with contextlib.suppress(Exception):
         if page.locator("input[type=password]").count() > 0:
             return True
-    except Exception:
-        pass
     return False
+
+
+_session_cookie_warned = False
 
 
 def has_session(page):
     """ログイン済みかどうかを cookie で判定する（会員サイトのセッション cookie）。"""
+    global _session_cookie_warned
     try:
         return config.SESSION_COOKIE_NAME in page.evaluate("() => document.cookie")
-    except Exception:
+    except Exception as exc:
+        # 取得できないと「未ログイン」と誤判定して待ち続けるので、一度だけ知らせる。
+        if not _session_cookie_warned:
+            _session_cookie_warned = True
+            ui.out(
+                f"セッション cookie を取得できませんでした（{exc}）。ログイン判定を続けます。",
+                "yellow",
+            )
         return False
 
 
-LOGIN_ID_SELECTOR = "#signInName"
-LOGIN_PASSWORD_SELECTOR = "#password"
-LOGIN_SUBMIT_SELECTOR = "#localAccountForm button[type=submit], #next"
+# ログイン画面のセレクタは config.py に置いてある（DOM セレクタは config に集約する方針）。
+LOGIN_ID_SELECTOR = config.LOGIN_ID_SELECTOR
+LOGIN_PASSWORD_SELECTOR = config.LOGIN_PASSWORD_SELECTOR
+LOGIN_SUBMIT_SELECTOR = config.LOGIN_SUBMIT_SELECTOR
 
 
 def has_credentials():
@@ -237,7 +259,12 @@ def try_auto_login(page):
         # Chrome のパスワード保存が自動入力済みなら、それをそのまま送信する。
         try:
             filled = page.evaluate(FILLED_JS)
-        except Exception:
+        except Exception as exc:
+            # 保存済みパスワードの自動入力は補助なので、失敗したら手動ログインに任せる。
+            ui.out(
+                f"自動入力の状態を確認できませんでした（{exc}）。手動ログインを待ちます。",
+                "yellow",
+            )
             return False
         if filled.get("id") and filled.get("pw", 0) >= 4:
             try:
