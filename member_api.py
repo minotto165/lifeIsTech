@@ -154,12 +154,8 @@ def to_target(chapter, lesson):
     )
 
 
-def iter_lessons(api, course, scope="chapter", chapter_label=None):
-    """未完了レッスンを順番に返す。
-
-    scope="chapter": 最初の未完了レッスンを含む章だけを対象にする。
-    scope="course" : コース内の全章を順に見る。
-    """
+def chapter_details(api, course, chapter_label=None):
+    """章の詳細を sort_no 順に返す（コース側の情報をマージ済み）。"""
     chapters = sorted(
         course.get("chapters") or [], key=lambda c: c.get("sort_no") or 0
     )
@@ -174,7 +170,6 @@ def iter_lessons(api, course, scope="chapter", chapter_label=None):
             raise MemberApiError(f"章「{chapter_label}」が見つかりません。")
 
     textbook_id = (course.get("textbook") or {}).get("id")
-    targets = []
     for chapter in chapters:
         detail = api.chapter(chapter.get("id"))
         if detail is None:
@@ -190,6 +185,17 @@ def iter_lessons(api, course, scope="chapter", chapter_label=None):
             raise MemberApiError(
                 f"章 {chapter.get('id')} の textbook_id が分からず、レッスンページの URL を組み立てられません。"
             )
+        yield detail
+
+
+def iter_lessons(api, course, scope="chapter", chapter_label=None):
+    """未完了レッスンを順番に返す。
+
+    scope="chapter": 最初の未完了レッスンを含む章だけを対象にする。
+    scope="course" : コース内の全章を順に見る。
+    """
+    targets = []
+    for detail in chapter_details(api, course, chapter_label):
         pending = []
         for lesson in detail.get("lessons") or []:
             target = to_target(detail, lesson)
@@ -204,4 +210,16 @@ def iter_lessons(api, course, scope="chapter", chapter_label=None):
         targets.extend(pending)
         if scope == "chapter":
             break
+    return targets
+
+
+def list_all_lessons(api, course, chapter_label=None):
+    """コース内の全レッスンを章順・レッスン順で返す（完了済みも含む）。
+
+    CLI でレッスンを選ぶときに使う。ロック中も一覧には出すが、実行はできない。
+    """
+    targets = []
+    for detail in chapter_details(api, course, chapter_label):
+        for lesson in detail.get("lessons") or []:
+            targets.append(to_target(detail, lesson))
     return targets

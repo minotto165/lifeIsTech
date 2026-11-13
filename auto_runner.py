@@ -17,19 +17,21 @@ import sys
 import time
 
 import config
+import ui
 from chrome_session import ChromeSession, safe_page_url
-from human_utils import human_sleep
 from instance_guard import acquire as acquire_instance
 from lifeistech_auto import log, run_lesson
 from member_api import (
     STATUS_CLEARED,
+    STATUS_LOCKED,
     AuthError,
     MemberApi,
     MemberApiError,
     find_course,
     iter_lessons,
+    list_all_lessons,
 )
-from work_automation import run_work
+from work_automation import already_graded, run_work
 
 LESSON_BUTTONS = ", ".join(
     [
@@ -138,7 +140,7 @@ def click_and_wait(context, page, selector, marker, timeout):
                 return candidate
         if marker in current_url(page):
             return page
-        time.sleep(0.2)
+        time.sleep(config.NAV_POLL_SEC)
     return None
 
 
@@ -251,10 +253,10 @@ def wait_for_player(api, context, page, target, selector, before, timeout=None):
                         # 「interrupted by another navigation」で goto が失敗する。
                         # 遷移は進んでいるので URL を確かめて続行する。
                         log(f"プレイヤーの遷移を待ちます: {e}")
-                        human_sleep(0.5)
+                        time.sleep(config.NAV_POLL_SEC)
                         if config.LESSON_PAGE_MARKER in current_url(page):
                             return page
-        time.sleep(0.5)
+        time.sleep(config.NAV_POLL_SEC)
     return None
 
 
@@ -272,7 +274,7 @@ def wait_for_cleared(api, target, timeout):
             raise
         except MemberApiError as e:
             last_status = str(e)
-        time.sleep(1.0)
+        time.sleep(config.API_POLL_SEC)
     log(f"クリアを確認できませんでした（status={last_status}）。")
     return False
 
@@ -285,9 +287,43 @@ def resume_url(api, target):
     return (detail.get("continue_link") or {}).get("player_url")
 
 
-def run_checkwork(context, page, target):
-    """レッスン完了後に理解度チェックワークを 1 回だけ解く。"""
-    log("理解度チェックワークを開始します。")
+def checkwork_of(api, target):
+    """このレッスンに対応する理解度チェックワークの id（無ければ None）。"""
+    try:
+        detail = api.lesson(target.chapter_id, target.lesson_id) or {}
+    except AuthError:
+        raise
+    except MemberApiError as e:
+        log(f"チェックワークの取得に失敗しました: {e}")
+        return None
+    for key in ("variant_checkwork", "checkwork"):
+        checkwork = detail.get(key) or {}
+        if checkwork.get("id"):
+            return checkwork
+    return None
+
+
+def wait_for_graded(page, timeout=10.0):
+    """採点結果の画面になるまで待つ。"""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if already_graded(page):
+            return True
+        time.sleep(config.FAST_POLL_SEC)
+    return False
+
+
+def run_checkwork(api, context, page, target):
+    """レッスン完了後に、対応する理解度チェックワークを解く。"""
+    if not config.AUTO_RUN_CHECKWORK:
+        return True
+    checkwork = checkwork_of(api, target)
+    if not checkwork:
+        log("このレッスンには理解度チェックワークがありません。")
+        return True
+    label = checkwork.get("id")
+    log(f"理解度チェックワークを開始します（{label}）。")
+    started = time.monotonic()
     if not goto_lesson_page(page, target):
         return False
     try:
@@ -313,10 +349,15 @@ def run_checkwork(context, page, target):
 
     try:
         ok = run_work(work_page)
+        if ok:
+            wait_for_graded(work_page)
     finally:
         if work_page is not page and not work_page.is_closed():
             work_page.close()
-    log("チェックワークを採点しました。" if ok else "チェックワークを完了できませんでした。")
+    if ok:
+        log(f"チェックワークを採点しました（{time.monotonic() - started:.1f} 秒）。")
+    else:
+        log("チェックワークを完了できませんでした。")
     return ok
 
 
@@ -378,7 +419,7 @@ def run_one(api, context, page, target, index, total):
         if wait_for_cleared(api, target, config.AUTO_CLEAR_WAIT_SEC):
             log(f"レッスンをクリアしました（{time.monotonic() - started:.1f} 秒）。")
             if config.AUTO_RUN_CHECKWORK:
-                run_checkwork(context, page, target)
+                run_checkwork(api, context, page, target)
             return True
 
         url = resume_url(api, target)
@@ -397,7 +438,7 @@ def run_one(api, context, page, target, index, total):
         if wait_for_cleared(api, target, config.AUTO_CLEAR_WAIT_SEC):
             log(f"レッスンをクリアしました（{time.monotonic() - started:.1f} 秒）。")
             if config.AUTO_RUN_CHECKWORK:
-                run_checkwork(context, page, target)
+                run_checkwork(api, context, page, target)
             return True
         screenshot(player, f"not_cleared_{target.lesson_id}")
         return False
@@ -406,19 +447,97 @@ def run_one(api, context, page, target, index, total):
             player.close()
 
 
+# 一覧表示用の状態ラベル（API は unstarted / unlocked / started / cleared / locked を返す）。
+STATUS_LABELS = {
+    STATUS_CLEARED: "完了",
+    "started": "途中",
+    "unstarted": "未着手",
+    "unlocked": "未着手",
+    STATUS_LOCKED: "ロック",
+}
+
+
+def status_label(status):
+    return STATUS_LABELS.get(status, status or "?")
+
+
+def select_lesson(api, course, chapter_label=None):
+    """レッスンの一覧を表示し、番号で選ばれた 1 本を返す。
+
+    完了済みも含めた全レッスンを出す。ロック中は選べない。
+    """
+    targets = list_all_lessons(api, course, chapter_label)
+    if not targets:
+        log("レッスンが見つかりませんでした。")
+        return None
+
+    ui.blank()
+    ui.header(f"コース「{course.get('name')}」のレッスン一覧")
+    current_chapter = None
+    rows = []
+    for index, target in enumerate(targets, 1):
+        if target.chapter_label != current_chapter:
+            if rows:
+                ui.lesson_table(rows)
+                rows = []
+            current_chapter = target.chapter_label
+            heading = f"{current_chapter} {target.chapter_title}".rstrip()
+            ui.chapter(heading)
+        label = target.label if target.label not in ("", "-", None) else str(target.lesson_id)
+        title = f"「{target.title}」" if target.title else ""
+        rows.append((index, label, title, status_label(target.status)))
+    if rows:
+        ui.lesson_table(rows)
+    ui.blank()
+
+    while True:
+        try:
+            raw = ui.ask("実行するレッスンの番号を入力してください（q で終了）: ")
+        except EOFError:
+            return None
+        raw = raw.strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        if not raw.isdigit():
+            log("番号を入力してください。")
+            continue
+        index = int(raw)
+        if not 1 <= index <= len(targets):
+            log(f"1〜{len(targets)} の番号を入力してください。")
+            continue
+        target = targets[index - 1]
+        if target.status == STATUS_LOCKED:
+            log("ロック中のレッスンは実行できません。")
+            continue
+        return target
+
+
 def print_targets(course, targets, scope):
-    log(
+    ui.blank()
+    ui.header(
         f"コース「{course.get('name')}」/ 範囲: {scope} / "
         f"未完了レッスン: {len(targets)} 件"
     )
+    rows = []
     for index, target in enumerate(targets, 1):
-        log(f"{index:2d}. {target.name} ({target.status})")
-        log(f"    {target.page_url()}")
+        label = target.label if target.label not in ("", "-", None) else str(target.lesson_id)
+        title = f"「{target.title}」" if target.title else ""
+        rows.append((index, label, title, status_label(target.status)))
+    if rows:
+        ui.lesson_table(rows)
+    ui.blank()
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="未完了レッスンを自動選択して連続実行します。"
+    )
+    parser.add_argument(
+        "--select",
+        "--choose",
+        dest="select",
+        action="store_true",
+        help="レッスン一覧から番号で選んで 1 本だけ実行する",
     )
     parser.add_argument(
         "--dry-run",
@@ -441,6 +560,19 @@ def parse_args(argv=None):
         action="store_true",
         help="自動化できなかったレッスンで停止する（既定は記録して次へ進む）",
     )
+    parser.add_argument(
+        "--checkwork",
+        dest="checkwork",
+        action="store_true",
+        default=None,
+        help="レッスン完了後に理解度チェックワークも解く（既定）",
+    )
+    parser.add_argument(
+        "--no-checkwork",
+        dest="checkwork",
+        action="store_false",
+        help="理解度チェックワークを解かない",
+    )
     return parser.parse_args(argv)
 
 
@@ -451,6 +583,8 @@ def apply_args(args):
         config.AUTO_SCOPE = args.scope
     if args.chapter:
         config.AUTO_CHAPTER_LABEL = args.chapter
+    if args.checkwork is not None:
+        config.AUTO_RUN_CHECKWORK = args.checkwork
     limit = config.AUTO_MAX_LESSONS
     if args.max is not None:
         limit = args.max
@@ -472,6 +606,18 @@ def main(argv=None):
         api = MemberApi(context)
 
         course = find_course(api.textbook_courses(), config.AUTO_COURSE_NAME)
+
+        if args.select:
+            target = select_lesson(api, course, config.AUTO_CHAPTER_LABEL)
+            if target is None:
+                log("レッスンを選ばなかったため終了します。")
+                exit_code = 0
+                return exit_code
+            # 明示的に選んだレッスンなので、完了済みでも「最初からやり直す」を許す。
+            config.AUTO_RESTART_PARTIAL = True
+            exit_code = 0 if run_one(api, context, page, target, 1, 1) else 1
+            return exit_code
+
         targets = iter_lessons(
             api,
             course,
