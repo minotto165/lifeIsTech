@@ -28,7 +28,7 @@ uv run python main.py
 | 1 | 開いているレッスンを自動で進める |
 | 2 | 理解度チェックワークを解く |
 | 3 | 未完了レッスンを探して連続実行（チェックワーク込み） |
-| 4 | 一覧から番号で選んで 1 本実行 |
+| 4 | 一覧から番号で選んで実行（`1-3` / `1,4,6` の範囲指定可） |
 | 5 | 未実施の理解度チェックワークをまとめて実行 |
 | 0 | 終了 |
 
@@ -37,7 +37,7 @@ uv run python main.py
 ```bash
 uv run python main.py 3 --max 1
 uv run python auto_runner.py --dry-run      # 対象の一覧だけ表示
-uv run python auto_runner.py --select       # レッスンを選んで実行
+uv run python auto_runner.py --select       # レッスンを選んで実行（番号は 1-3 / 1,4,6 でも可）
 uv run python auto_runner.py --checkworks   # 未実施のチェックワークだけ実行
 ```
 

@@ -14,6 +14,7 @@ Chrome に接続し、受講者 API からコース・章・レッスンの進�
 
 import argparse
 import pathlib
+import re
 import sys
 import time
 
@@ -587,9 +588,45 @@ def status_label(status):
     return STATUS_LABELS.get(status, status or "?")
 
 
-def select_lesson(api, course, chapter_label=None):
-    """レッスンの一覧を表示し、番号で選ばれた 1 本を返す。
+# 「1-3」「1〜3」「1,4」などの指定で使う区切り。全角・半角どちらも受ける。
+SELECTION_SEPARATORS = ("-", "–", "—", "〜", "~")
 
+
+def parse_selection(raw, count):
+    """「3」「1,4,6」「3-7」「1-3,7」のような指定を番号のリストにする。
+
+    重複は取り除き、指定した順に返す。読めない指定は ValueError。
+    """
+    text = re.sub(r"\s*([-–—〜~])\s*", r"\1", raw.strip())
+    chunks = [chunk for chunk in re.split(r"[,、\s]+", text) if chunk]
+    if not chunks:
+        raise ValueError("番号を入力してください。")
+    numbers = []
+    for chunk in chunks:
+        separator = next((s for s in SELECTION_SEPARATORS if s in chunk), None)
+        if separator is None:
+            if not chunk.isdigit():
+                raise ValueError(f"「{chunk}」は番号ではありません。")
+            numbers.append(int(chunk))
+            continue
+        start, _, end = chunk.partition(separator)
+        if not (start.isdigit() and end.isdigit()):
+            raise ValueError(f"「{chunk}」の範囲を読み取れませんでした。")
+        low, high = sorted((int(start), int(end)))
+        numbers.extend(range(low, high + 1))
+    unique = list(dict.fromkeys(numbers))
+    for number in unique:
+        if not 1 <= number <= count:
+            raise ValueError(
+                f"「{number}」は範囲外です。1〜{count} の番号を指定してください。"
+            )
+    return unique
+
+
+def select_lessons(api, course, chapter_label=None):
+    """レッスンの一覧を表示し、番号で選ばれたレッスンを返す。
+
+    番号は「3」のほか「1-3」「1,4,6」「1-3,7」のように範囲・カンマ区切りで指定できる。
     完了済みも含めた全レッスンを出す。ロック中は選べない。
     """
     targets = list_all_lessons(api, course, chapter_label)
@@ -618,24 +655,32 @@ def select_lesson(api, course, chapter_label=None):
 
     while True:
         try:
-            raw = ui.ask("実行するレッスンの番号を入力してください（q で終了）: ")
+            raw = ui.ask(
+                "実行するレッスンの番号（例: 3 / 1-3 / 1,4,6、q で終了）: "
+            )
         except EOFError:
-            return None
-        raw = raw.strip()
-        if raw.lower() in ("q", "quit", "exit"):
-            return None
-        if not raw.isdigit():
-            log("番号を入力してください。")
+            return []
+        if raw.strip().lower() in ("q", "quit", "exit"):
+            return []
+        try:
+            indexes = parse_selection(raw, len(targets))
+        except ValueError as e:
+            log(str(e))
             continue
-        index = int(raw)
-        if not 1 <= index <= len(targets):
-            log(f"1〜{len(targets)} の番号を入力してください。")
+        chosen = [targets[index - 1] for index in indexes]
+        locked = [target for target in chosen if target.status == STATUS_LOCKED]
+        for target in locked:
+            log(f"「{target.name}」はロック中のため対象から外します。")
+        chosen = [target for target in chosen if target.status != STATUS_LOCKED]
+        if not chosen:
+            log("実行できるレッスンがありません。番号を選び直してください。")
             continue
-        target = targets[index - 1]
-        if target.status == STATUS_LOCKED:
-            log("ロック中のレッスンは実行できません。")
-            continue
-        return target
+        if len(chosen) > 1:
+            ui.blank()
+            log(f"{len(chosen)} 件を順に実行します。")
+            for target in chosen:
+                log(f"  - {target.name}")
+        return chosen
 
 
 def print_targets(course, targets, scope):
@@ -663,7 +708,7 @@ def parse_args(argv=None):
         "--choose",
         dest="select",
         action="store_true",
-        help="レッスン一覧から番号で選んで 1 本だけ実行する",
+        help="レッスン一覧から番号で選んで実行する（1-3 / 1,4,6 の範囲指定も可）",
     )
     parser.add_argument(
         "--dry-run",
@@ -779,17 +824,18 @@ def main(argv=None):
             return exit_code
 
         if args.select:
-            target = select_lesson(api, course, config.AUTO_CHAPTER_LABEL)
-            if target is None:
+            targets = select_lessons(api, course, config.AUTO_CHAPTER_LABEL)
+            if not targets:
                 log("レッスンを選ばなかったため終了します。")
                 exit_code = 0
                 return exit_code
             # 明示的に選んだレッスンなので、完了済みでも「最初からやり直す」を許す。
             config.AUTO_RESTART_PARTIAL = True
-            result = run_one(api, context, page, target, 1, 1)
-            if result == RESULT_SKIPPED:
-                log("選択したレッスンは公開されていないため、実行していません。")
-            exit_code = 0 if result != RESULT_FAILED else 1
+            results = run_targets(
+                api, context, page, targets, stop_on_failure=args.stop_on_failure
+            )
+            print_summary(results)
+            exit_code = 1 if results["failed"] else 0
             return exit_code
 
         targets = iter_lessons(
