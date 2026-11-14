@@ -8,8 +8,9 @@ MCP のツール呼び出しは即座に返したいので、実際のレッス�
 
 kind:
     lesson    ... 1 本のレッスンを最初から（または続きから）実行する
-    checkwork ... 1 本の理解度チェックワークを実行する
-    auto      ... 未完了レッスンを連続実行する
+    checkwork  ... 1 本の理解度チェックワークを実行する
+    checkworks ... 未実施の理解度チェックワークをまとめて実行する
+    auto       ... 未完了レッスンを連続実行する
 """
 
 import argparse
@@ -27,6 +28,7 @@ from member_api import (
     MemberApi,
     MemberApiError,
     find_course,
+    find_pending_checkworks,
     iter_lessons,
     resolve_lesson,
 )
@@ -43,7 +45,9 @@ def write_result(path, payload):
 
 def build_parser(argv=None):
     parser = argparse.ArgumentParser(description="MCP 用のジョブ実行")
-    parser.add_argument("--kind", required=True, choices=("lesson", "checkwork", "auto"))
+    parser.add_argument(
+        "--kind", required=True, choices=("lesson", "checkwork", "checkworks", "auto")
+    )
     parser.add_argument("--result", required=True, help="結果 JSON の出力先")
     parser.add_argument("--lesson", type=int, help="レッスン ID")
     parser.add_argument("--chapter-id", type=int, help="章 ID（分かっていれば探索を省ける）")
@@ -52,7 +56,9 @@ def build_parser(argv=None):
     parser.add_argument("--no-checkwork", dest="checkwork", action="store_false")
     parser.add_argument("--scope", default=config.AUTO_SCOPE, choices=("chapter", "course"))
     parser.add_argument("--chapter", default=config.AUTO_CHAPTER_LABEL)
+    parser.add_argument("--course", help="コース名（既定: config.AUTO_COURSE_NAME）")
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--checkwork-min-score", type=int)
     return parser.parse_args(argv)
 
 
@@ -68,6 +74,10 @@ def run(args):
 
     if args.checkwork is not None:
         config.AUTO_RUN_CHECKWORK = args.checkwork
+    if args.checkwork_min_score is not None:
+        config.CHECKWORK_MIN_SCORE = args.checkwork_min_score
+    if args.course:
+        config.AUTO_COURSE_NAME = args.course
     if args.from_scratch:
         # 明示的に選ばれたレッスンなので、完了済みでも最初からやり直せるようにする。
         config.AUTO_RESTART_PARTIAL = True
@@ -84,9 +94,13 @@ def run(args):
             if target is None:
                 return {"ok": False, "error": f"レッスン {args.lesson} が見つかりません。"}
             if args.kind == "checkwork":
+                # 明示的に指定されたワークなので、実施済みでもやり直す。
                 config.AUTO_RUN_CHECKWORK = True
+                status = api.checkwork_status(target.chapter_id, target.lesson_id)
                 started = time.monotonic()
-                ok = auto_runner.run_checkwork(api, context, page, target)
+                ok = auto_runner.run_checkwork(
+                    api, context, page, target, force=True, status=status
+                )
                 return {
                     "ok": ok,
                     "seconds": round(time.monotonic() - started, 1),
@@ -95,6 +109,7 @@ def run(args):
                             "lesson_id": target.lesson_id,
                             "name": target.name,
                             "result": auto_runner.RESULT_DONE if ok else auto_runner.RESULT_FAILED,
+                            "checkwork_before": status.describe(),
                         }
                     ],
                 }
@@ -105,6 +120,44 @@ def run(args):
                 "seconds": round(time.monotonic() - started, 1),
                 "results": [
                     {"lesson_id": target.lesson_id, "name": target.name, "result": result}
+                ],
+            }
+
+        if args.kind == "checkworks":
+            entries = find_pending_checkworks(
+                api,
+                course,
+                chapter_label=args.chapter,
+                min_score=config.CHECKWORK_MIN_SCORE,
+            )
+            if args.limit:
+                entries = entries[: args.limit]
+            if not entries:
+                return {
+                    "ok": True,
+                    "results": [],
+                    "note": "未実施の理解度チェックワークはありません。",
+                }
+            results = auto_runner.run_checkworks(api, context, page, entries)
+            return {
+                "ok": not results["failed"],
+                "results": [
+                    {
+                        "lesson_id": entry.target.lesson_id,
+                        "name": entry.name,
+                        "checkwork_id": entry.checkwork_id,
+                        "result": "done",
+                    }
+                    for entry in results["done"]
+                ]
+                + [
+                    {
+                        "lesson_id": entry.target.lesson_id,
+                        "name": entry.name,
+                        "checkwork_id": entry.checkwork_id,
+                        "result": "failed",
+                    }
+                    for entry in results["failed"]
                 ],
             }
 

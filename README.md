@@ -29,6 +29,7 @@ uv run python main.py
 | 2 | 理解度チェックワークを解く |
 | 3 | 未完了レッスンを探して連続実行（チェックワーク込み） |
 | 4 | 一覧から番号で選んで 1 本実行 |
+| 5 | 未実施の理解度チェックワークをまとめて実行 |
 | 0 | 終了 |
 
 メニューを飛ばして直接起動できます。引数はそのまま渡ります。
@@ -37,6 +38,7 @@ uv run python main.py
 uv run python main.py 3 --max 1
 uv run python auto_runner.py --dry-run      # 対象の一覧だけ表示
 uv run python auto_runner.py --select       # レッスンを選んで実行
+uv run python auto_runner.py --checkworks   # 未実施のチェックワークだけ実行
 ```
 
 主なオプション（`auto_runner.py`）:
@@ -48,6 +50,8 @@ uv run python auto_runner.py --select       # レッスンを選んで実行
 | `--chapter "第5章"` | 章を指定 |
 | `--max N` | 実行する本数の上限（0 で無制限） |
 | `--no-checkwork` | レッスン完了後の理解度チェックワークを解かない |
+| `--checkworks` / `--checkwork-only` | 未実施のチェックワークだけをまとめて実行 |
+| `--checkwork-min-score N` | チェックワークの完了基準（既定 0 = 1 回実施で完了、100 = 満点まで） |
 | `--stop-on-failure` | 自動化できなかった時点で停止する |
 
 同じツールの二重起動は `.lifeistech.lock` で防いでいます（2 つ目は起動時に終了します）。
@@ -58,6 +62,7 @@ uv run python auto_runner.py --select       # レッスンを選んで実行
 - コード課題はシナリオの正解を Ace エディタへ実際のキー入力で書き込みます。プレビュー課題（表計算など）は iframe 内の成功条件を読んでセルを操作します。
 - 待機は固定 sleep ではなく「状態が変わるまで 10ms 間隔で見る」方式です。演出（CSS トランジション）と長い `setTimeout` はページ内に注入して短縮しています（`config.py` の `DISABLE_CSS_ANIMATION` / `SHORTEN_LONG_TIMERS`）。
 - 自由入力のコード検証のように正解がシナリオに無いレッスンは自動化できないため、スキップして次へ進みます。
+- チェックワークの進捗は API の採点履歴（実施回数・最新／最高スコア）で判定します。実施済みならページを開かずにスキップし、`--checkworks` では「レッスンは完了したがチェックワークが未実施」のものも拾います。
 
 ## MCP サーバー
 
@@ -74,7 +79,7 @@ MCP クライアント（Claude Desktop など）から一覧取得と実行を�
 }
 ```
 
-ツールは `chrome_status` / `list_courses` / `list_lessons` / `start_lesson` / `start_checkwork` / `start_auto` / `job_status` / `job_stop` / `list_jobs` の 9 個。
+ツールは `chrome_status` / `list_courses` / `list_lessons` / `list_checkworks` / `start_lesson` / `start_checkwork` / `start_checkworks` / `start_auto` / `job_status` / `job_stop` / `list_jobs` の 11 個。
 実行はジョブ（子プロセス）に任せてすぐ `job_id` を返すので、進捗は `job_status` でポーリングしてください。同時実行は 1 ジョブです。Chrome が起動していないと一覧系は失敗します。
 
 ## 設定

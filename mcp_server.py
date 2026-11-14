@@ -32,6 +32,7 @@ from member_api import (  # noqa: E402
     MemberApi,
     chapter_details,
     find_course,
+    find_pending_checkworks,
 )
 from playwright.sync_api import sync_playwright  # noqa: E402
 
@@ -366,6 +367,75 @@ def list_lessons(course: str = "", chapter: str = "", unfinished_only: bool = Tr
                 continue
             rows.append(_target_dict(target))
     return {"count": len(rows), "lessons": rows}
+
+
+@mcp.tool()
+def list_checkworks(course: str = "", chapter: str = "", min_score: int = 0):
+    """未実施（または基準スコア未満）の理解度チェックワークを一覧する。
+
+    Args:
+        course: コース名（空なら config.AUTO_COURSE_NAME）。
+        chapter: 章の絞り込み（例 "第4章"、空なら全章）。
+        min_score: 完了基準。0 なら「1 回でも実施済み」は除外（未実施だけ）。100 なら満点まで対象。
+    """
+    api, course_info = _course(course or None)
+    entries = find_pending_checkworks(
+        api,
+        course_info,
+        chapter_label=chapter or None,
+        min_score=max(0, int(min_score or 0)),
+    )
+    return {
+        "count": len(entries),
+        "checkworks": [
+            {
+                "lesson_id": entry.target.lesson_id,
+                "chapter_id": entry.target.chapter_id,
+                "chapter_label": entry.target.chapter_label,
+                "label": entry.target.label,
+                "title": entry.target.title,
+                "lesson_status": entry.target.status,
+                "checkwork_id": entry.checkwork_id,
+                "attempts": entry.status.attempts,
+                "latest_score": entry.status.latest_score,
+                "best_score": entry.status.best_score,
+                "name": entry.name,
+                "url": entry.target.page_url(),
+            }
+            for entry in entries
+        ],
+    }
+
+
+@mcp.tool()
+def start_checkworks(
+    course: str = "", chapter: str = "", limit: int = 0, min_score: int = 0
+):
+    """未実施の理解度チェックワークをまとめて実行する（即座に job_id を返す）。
+
+    Args:
+        course: コース名（空なら config.AUTO_COURSE_NAME）。
+        chapter: 章の絞り込み（例 "第4章"、空なら全章）。
+        limit: 実行する最大本数（0 なら無制限）。
+        min_score: 完了基準。0 なら未実施だけ、100 なら満点までやり直す。
+    """
+    args = ["--limit", str(max(0, int(limit or 0)))]
+    if chapter:
+        args += ["--chapter", chapter]
+    if course:
+        args += ["--course", course]
+    args += ["--checkwork-min-score", str(max(0, int(min_score or 0)))]
+    job = _start_job(
+        "checkworks",
+        {
+            "course": course or None,
+            "chapter": chapter or None,
+            "limit": limit,
+            "min_score": min_score,
+        },
+        args,
+    )
+    return {"job_id": job["job_id"], "status": "running"}
 
 
 @mcp.tool()

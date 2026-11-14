@@ -52,6 +52,48 @@ class LessonTarget:
         )
 
 
+@dataclass
+class CheckworkStatus:
+    """理解度チェックワークの実施状況（API の採点履歴から作る）。"""
+
+    attempts: int = 0
+    latest_score: int | None = None
+    best_score: int | None = None
+    submitted_at: str | None = None
+
+    def is_done(self, min_score=0):
+        """完了とみなすか。min_score=0 なら「1 回でも実施したか」だけを見る。"""
+        if self.attempts == 0:
+            return False
+        if min_score <= 0:
+            return True
+        # 一度でも満点に届いていれば完了扱い（最新が下がってもやり直さない）。
+        return (self.best_score or 0) >= min_score
+
+    def describe(self):
+        if self.attempts == 0:
+            return "未実施"
+        parts = [f"{self.attempts} 回実施"]
+        if self.latest_score is not None:
+            parts.append(f"最新 {self.latest_score}%")
+        if self.best_score is not None:
+            parts.append(f"最高 {self.best_score}%")
+        return " / ".join(parts)
+
+
+@dataclass
+class CheckworkEntry:
+    """未実施のチェックワーク 1 件（レッスンとワークの対応）。"""
+
+    target: LessonTarget
+    checkwork_id: int
+    status: CheckworkStatus
+
+    @property
+    def name(self):
+        return self.target.name
+
+
 class MemberApi:
     def __init__(self, context=None, token=None):
         self._token = token or read_token(context)
@@ -103,6 +145,22 @@ class MemberApi:
         return self._request(
             f"players/textbooks/chapters/{chapter_id}/lessons/{lesson_id}"
         )
+
+    def checkwork_scores(self, chapter_id, lesson_id):
+        """理解度チェックワークの採点履歴を新しい順で返す（無ければ空リスト）。
+
+        レッスンページが表示している「実施回数 / 最新3回の結果 / 満点回数」と
+        同じデータ。未実施なら空リストになる。
+        """
+        data = self._request(
+            f"players/textbooks/chapters/{int(chapter_id)}"
+            f"/lessons/{int(lesson_id)}/player_checkwork_scores"
+        )
+        return data or []
+
+    def checkwork_status(self, chapter_id, lesson_id):
+        """採点履歴を集計して CheckworkStatus を返す。"""
+        return summarize_checkwork(self.checkwork_scores(chapter_id, lesson_id))
 
 
 def read_token(context):
@@ -252,3 +310,76 @@ def list_all_lessons(api, course, chapter_label=None):
         for lesson in detail.get("lessons") or []:
             targets.append(to_target(detail, lesson))
     return targets
+
+
+# --- 理解度チェックワークの進捗 ---------------------------------------
+
+
+def _score_of(entry):
+    try:
+        return int(entry.get("score"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def summarize_checkwork(scores):
+    """採点履歴（新しい順とは限らない）から実施回数とスコアを集計する。"""
+    ordered = sorted(
+        scores or [], key=lambda s: (s.get("submitted_at") or ""), reverse=True
+    )
+    values = [value for value in (_score_of(s) for s in ordered) if value is not None]
+    return CheckworkStatus(
+        attempts=len(ordered),
+        latest_score=values[0] if values else None,
+        best_score=max(values) if values else None,
+        submitted_at=ordered[0].get("submitted_at") if ordered else None,
+    )
+
+
+def checkwork_of(api, target, detail=None):
+    """このレッスンに対応する理解度チェックワーク（無ければ None）。"""
+    if detail is None:
+        detail = api.lesson(target.chapter_id, target.lesson_id) or {}
+    for key in ("variant_checkwork", "checkwork"):
+        checkwork = detail.get(key) or {}
+        if checkwork.get("id"):
+            return checkwork
+    return None
+
+
+def find_pending_checkworks(api, course, chapter_label=None, min_score=None, verbose=True):
+    """未実施（または min_score 未満）のチェックワークを章順に返す。
+
+    完了済みレッスンも対象に含める。スライドだけ終わらせてチェックワークを
+    やっていないレッスンを拾うのが目的なので、iter_lessons とは別に全レッスンを見る。
+    """
+    if min_score is None:
+        min_score = config.CHECKWORK_MIN_SCORE
+    entries = []
+    seen = 0
+    for detail in chapter_details(api, course, chapter_label):
+        for lesson in detail.get("lessons") or []:
+            target = to_target(detail, lesson)
+            if target.status == STATUS_LOCKED:
+                continue
+            seen += 1
+            if verbose and seen % 10 == 0:
+                ui.log(f"チェックワークの状況を確認しています…（{seen} レッスン目）")
+            # 採点履歴が取れればワークの有無も分かるので、先にこちらを引く。
+            status = summarize_checkwork(
+                api.checkwork_scores(target.chapter_id, target.lesson_id)
+            )
+            if status.is_done(min_score):
+                continue
+            checkwork = checkwork_of(api, target)
+            if not checkwork:
+                # チェックワークが無いレッスンは対象外（失敗にしない）。
+                continue
+            entries.append(
+                CheckworkEntry(
+                    target=target,
+                    checkwork_id=checkwork.get("id"),
+                    status=status,
+                )
+            )
+    return entries

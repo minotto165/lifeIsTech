@@ -9,6 +9,7 @@ Chrome に接続し、受講者 API からコース・章・レッスンの進�
     uv run python auto_runner.py             # config.py の設定で実行
     uv run python auto_runner.py --dry-run   # 対象一覧だけ表示
     uv run python auto_runner.py --max 1     # 1 本だけ
+    uv run python auto_runner.py --checkworks  # 未実施のチェックワークだけ実行
 """
 
 import argparse
@@ -30,9 +31,12 @@ from member_api import (
     AuthError,
     MemberApi,
     MemberApiError,
+    checkwork_of,
     find_course,
+    find_pending_checkworks,
     iter_lessons,
     list_all_lessons,
+    summarize_checkwork,
 )
 from work_automation import already_graded, run_work
 
@@ -280,22 +284,6 @@ def resume_url(api, target):
     return (detail.get("continue_link") or {}).get("player_url")
 
 
-def checkwork_of(api, target):
-    """このレッスンに対応する理解度チェックワークの id（無ければ None）。"""
-    try:
-        detail = api.lesson(target.chapter_id, target.lesson_id) or {}
-    except AuthError:
-        raise
-    except MemberApiError as e:
-        log(f"チェックワークの取得に失敗しました: {e}")
-        return None
-    for key in ("variant_checkwork", "checkwork"):
-        checkwork = detail.get(key) or {}
-        if checkwork.get("id"):
-            return checkwork
-    return None
-
-
 def wait_for_graded(page, timeout=None):
     """採点結果の画面になるまで待つ。"""
     if timeout is None:
@@ -305,16 +293,34 @@ def wait_for_graded(page, timeout=None):
     )
 
 
-def run_checkwork(api, context, page, target):
-    """レッスン完了後に、対応する理解度チェックワークを解く。"""
-    if not config.AUTO_RUN_CHECKWORK:
+def run_checkwork(api, context, page, target, force=False, checkwork=None, status=None):
+    """レッスンに対応する理解度チェックワークを解く。
+
+    実施済みならページを開かずにスキップする（毎回開いて確認する無駄を無くす）。
+    force=True なら実施済みでもやり直す。checkwork / status を渡すと API 呼び出しを省ける。
+    """
+    if not config.AUTO_RUN_CHECKWORK and not force:
         return True
-    checkwork = checkwork_of(api, target)
-    if not checkwork:
-        log("このレッスンには理解度チェックワークがありません。")
+    try:
+        if checkwork is None:
+            checkwork = checkwork_of(api, target)
+        if not checkwork:
+            log("このレッスンには理解度チェックワークがありません。")
+            return True
+        if status is None:
+            status = summarize_checkwork(
+                api.checkwork_scores(target.chapter_id, target.lesson_id)
+            )
+    except AuthError:
+        raise
+    except MemberApiError as e:
+        log(f"チェックワークの状況を取得できませんでした: {e}")
+        return False
+    if not force and status.is_done(config.CHECKWORK_MIN_SCORE):
+        log(f"チェックワークは完了済みです（{status.describe()}）。スキップします。")
         return True
     label = checkwork.get("id")
-    log(f"理解度チェックワークを開始します（{label}）。")
+    log(f"理解度チェックワークを開始します（{label} / {status.describe()}）。")
     started = time.monotonic()
     if not goto_lesson_page(page, target):
         return False
@@ -349,11 +355,77 @@ def run_checkwork(api, context, page, target):
     finally:
         if work_page is not page and not work_page.is_closed():
             work_page.close()
+    elapsed = time.monotonic() - started
     if ok:
-        log(f"チェックワークを採点しました（{time.monotonic() - started:.1f} 秒）。")
+        try:
+            after = summarize_checkwork(
+                api.checkwork_scores(target.chapter_id, target.lesson_id)
+            )
+            log(f"チェックワークを採点しました（{after.describe()} / {elapsed:.1f} 秒）。")
+        except MemberApiError:
+            log(f"チェックワークを採点しました（{elapsed:.1f} 秒）。")
     else:
         log("チェックワークを完了できませんでした。")
     return ok
+
+
+def run_checkworks(api, context, page, entries):
+    """未実施のチェックワークを順に解く。"""
+    done = []
+    failed = []
+    total = len(entries)
+    for index, entry in enumerate(entries, 1):
+        log("")
+        log(f"[{index}/{total}] {entry.name}（{entry.status.describe()}）")
+        try:
+            ok = run_checkwork(
+                api,
+                context,
+                page,
+                entry.target,
+                force=True,
+                checkwork={"id": entry.checkwork_id},
+                status=entry.status,
+            )
+        except AuthError:
+            raise
+        except MemberApiError as e:
+            log(f"チェックワークの実行でエラーが発生しました: {e}")
+            ok = False
+        if ok:
+            done.append(entry)
+        else:
+            failed.append(entry)
+    return {"done": done, "failed": failed}
+
+
+def print_checkwork_targets(course, entries):
+    """未実施チェックワークの一覧を表示する。"""
+    ui.blank()
+    ui.header(f"コース「{course.get('name')}」/ 未完了の理解度チェックワーク: {len(entries)} 件")
+    rows = []
+    for index, entry in enumerate(entries, 1):
+        label = (
+            entry.target.label
+            if entry.target.label not in ("", "-", None)
+            else str(entry.target.lesson_id)
+        )
+        title = f"「{entry.target.title}」" if entry.target.title else ""
+        rows.append((index, label, title, entry.status.describe()))
+    if rows:
+        ui.lesson_table(rows)
+    ui.blank()
+
+
+def print_checkwork_summary(results):
+    done = results["done"]
+    failed = results["failed"]
+    log("")
+    log(f"チェックワーク完了 {len(done)} 件 / 失敗 {len(failed)} 件。")
+    if failed:
+        log(f"完了できなかったチェックワーク（{len(failed)} 件）:")
+        for entry in failed:
+            log(f"  - {entry.name} ({entry.target.lesson_id})")
 
 
 def lesson_unavailable(page):
@@ -627,6 +699,18 @@ def parse_args(argv=None):
         action="store_false",
         help="理解度チェックワークを解かない",
     )
+    parser.add_argument(
+        "--checkworks",
+        "--checkwork-only",
+        dest="checkworks",
+        action="store_true",
+        help="未実施の理解度チェックワークだけをまとめて実行する",
+    )
+    parser.add_argument(
+        "--checkwork-min-score",
+        type=int,
+        help="チェックワークの完了基準スコア（既定: config.CHECKWORK_MIN_SCORE）",
+    )
     return parser.parse_args(argv)
 
 
@@ -639,6 +723,8 @@ def apply_args(args):
         config.AUTO_CHAPTER_LABEL = args.chapter
     if args.checkwork is not None:
         config.AUTO_RUN_CHECKWORK = args.checkwork
+    if args.checkwork_min_score is not None:
+        config.CHECKWORK_MIN_SCORE = args.checkwork_min_score
     limit = config.AUTO_MAX_LESSONS
     if args.max is not None:
         limit = args.max
@@ -660,6 +746,37 @@ def main(argv=None):
         api = MemberApi(context)
 
         course = find_course(api.textbook_courses(), config.AUTO_COURSE_NAME)
+
+        if args.checkworks:
+            entries = find_pending_checkworks(
+                api,
+                course,
+                chapter_label=config.AUTO_CHAPTER_LABEL,
+                min_score=config.CHECKWORK_MIN_SCORE,
+            )
+            if args.lesson:
+                entries = [
+                    entry for entry in entries if entry.target.lesson_id == args.lesson
+                ]
+                if not entries:
+                    log(
+                        f"レッスン {args.lesson} は未実施のチェックワークに含まれていません。"
+                    )
+                    return 1
+            if limit:
+                entries = entries[:limit]
+            print_checkwork_targets(course, entries)
+            if args.dry_run:
+                exit_code = 0
+                return exit_code
+            if not entries:
+                log("未実施の理解度チェックワークはありません。すべて実施済みです。")
+                exit_code = 0
+                return exit_code
+            results = run_checkworks(api, context, page, entries)
+            print_checkwork_summary(results)
+            exit_code = 1 if results["failed"] else 0
+            return exit_code
 
         if args.select:
             target = select_lesson(api, course, config.AUTO_CHAPTER_LABEL)

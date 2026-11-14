@@ -22,6 +22,11 @@ MENU = {
         "auto_runner.py",
         ("--select",),
     ),
+    "5": (
+        "未実施の理解度チェックワークをまとめて実行",
+        "auto_runner.py",
+        ("--checkworks",),
+    ),
 }
 
 

@@ -213,6 +213,10 @@ LESSON_PAGE_READY_TIMEOUT = 30.0
 # レッスン完了後に理解度チェックワークも続けて解く（設問はランダムなので AI で回答）。
 # CLI の --checkwork / --no-checkwork で上書きできる。
 AUTO_RUN_CHECKWORK = True
+# 理解度チェックワークの完了基準。このスコア以上を取れていれば完了とみなす。
+# 0 にすると「1 回でも実施したら完了」（未実施のワークだけを対象にする）。
+# 100 にすると満点を取るまでやり直す。CLI の --checkwork-min-score で上書きできる。
+CHECKWORK_MIN_SCORE = 0
 # チェックワークで設問が切り替わるまで待つ上限（秒）。
 WORK_STEP_TIMEOUT = 5.0
 # チェックワークの採点結果（「もう一度チャレンジする」）が出るまで待つ上限（秒）。
